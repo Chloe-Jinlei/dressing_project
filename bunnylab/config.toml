@@ -1,0 +1,117 @@
+[experiment]
+task = "Scene setup: dual Franka arms, a deformable sloth toy and a sleeved T-shirt on a table. No dressing success evaluation yet."
+seed = 0
+
+[api]
+# Set OPENAI_MODEL to an image + structured-output capable model in your account.
+model = ""
+timeout_seconds = 60
+max_output_tokens = 1500
+
+[assets]
+robot = "assets/robot/panda.xml"
+garment = "assets/garment/green_tshirt_5k.obj"
+# User-selected rabbit asset required; no automatic substitute.
+bunny = ""
+sloth = "assets/bunny/deformgen/sloth/sloth.npz"
+sloth_texture = "assets/bunny/deformgen/sloth/sloth.png"
+
+[observation]
+cameras = ["overhead", "wrist", "table_side"]
+include_robot_state = true
+# Never include object meshes, ground-truth object poses, or true material parameters.
+
+[control]
+max_translation_m = 0.02
+duration_seconds = 1.0
+max_rotation_rad = 0.1
+max_joint_delta_rad = 0.2
+workspace_min = [-0.62, -0.42, 0.738]
+workspace_max = [0.62, 0.45, 1.65]
+# World XYZ in metres; bounded world-frame rotation vectors in radians.
+
+[route_a]
+model = "gpt-6-astra"
+decision_timeout_seconds = 180
+max_steps = 100
+camera_width = 640
+camera_height = 480
+video_fps = 15
+port = 8765
+
+[scene]
+backend = "warp"
+device = "cuda:0"
+solver = "CG"
+iterations = 300
+tolerance = 0.00001
+timestep = 0.001
+table_height = 0.74
+table_half_size = [0.65, 0.48, 0.035]
+left_base = [-0.48, 0.24, 0.775]
+right_base = [0.48, 0.24, 0.775]
+home = [0.0, -0.45, 0.0, -2.15, 0.0, 1.7, 0.7854]
+width = 1280
+height = 960
+fps = 25
+validation_seconds = 2.0
+
+[scene.sloth]
+position_xy = [-0.18, -0.08]
+mass = 0.18
+young = 8000.0
+poisson = 0.3
+damping = 0.001
+radius = 0.002
+friction = 0.7
+
+[scene.genesis]
+# Separate installed environment; route A's policy/dashboard stay in this project.
+python = "../genesis-local/.venv/bin/python"
+scene_module = "../genesis-local/dressing_scene.py"
+device = "cuda"
+substeps = 10
+particle_size = 0.004
+startup_timeout_seconds = 600
+request_timeout_seconds = 120
+
+[scene.genesis.sloth_material]
+# PBD.Elastic volumetric soft body. Larger compliance permits more deformation.
+# These are Genesis parameters, not a conversion of MuJoCo Young's modulus.
+stretch_compliance = 0.005
+volume_compliance = 1e-12
+stretch_relaxation = 0.3
+volume_relaxation = 0.3
+
+[scene.garment]
+position_xy = [0.18, -0.08]
+width = 0.30
+target_faces = 1200
+mass = 0.055
+young = 30000.0
+poisson = 0.3
+damping = 0.001
+thickness = 0.001
+radius = 0.001
+friction = 0.6
+
+[scene.cameras.overview]
+position = [1.35, -1.8, 1.9]
+target = [0.0, 0.0, 0.88]
+fovy = 44.0
+
+[scene.cameras.overhead]
+position = [0.0, -0.40, 1.85]
+target = [0.0, -0.08, 0.74]
+fovy = 43.0
+
+[scene.cameras.detail]
+position = [0.0, -0.85, 1.5]
+target = [0.0, -0.07, 0.76]
+fovy = 43.0
+
+[scene.cameras.table_side]
+# Horizontal optical axis, 6 cm above the tabletop.
+position = [0.0, -0.90, 0.80]
+target = [0.0, -0.08, 0.80]
+fovy = 45.0

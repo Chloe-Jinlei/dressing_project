@@ -1,0 +1,8 @@
+# Ubuntu 24.04: permit user namespaces for the system bubblewrap executable.
+# Filesystem isolation remains defined by the project's bubblewrap command.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile dressing-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}

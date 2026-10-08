@@ -1,0 +1,33 @@
+RGBench Cloth Sim-to-Real Dataset License
+==========================================
+
+SCOPE: This license applies ONLY to the RGBench Cloth Sim-to-Real capture
+dataset. The RGBench garment asset library
+(https://huggingface.co/datasets/RGBench/garment_assets) is released under a
+separate, non-commercial license and is NOT covered here.
+
+The RGBench Cloth Sim-to-Real dataset (the "Dataset"), including all
+real-world point clouds, RGB-D recordings, robot trajectory CSVs, camera
+calibration files, and reference simulator outputs hosted on Hugging Face
+under the RGBench Cloth Sim-to-Real namespace, is released under the
+Creative Commons Attribution 4.0 International License (CC-BY 4.0).
+
+You are free to:
+  - Share — copy and redistribute the material in any medium or format
+  - Adapt — remix, transform, and build upon the material for any purpose,
+            even commercially.
+
+Under the following terms:
+  - Attribution — You must give appropriate credit, provide a link to the
+                  license, and indicate if changes were made. You may do so
+                  in any reasonable manner, but not in any way that suggests
+                  the licensor endorses you or your use.
+
+Full license text: https://creativecommons.org/licenses/by/4.0/legalcode
+
+When citing the Dataset, please cite this repository (see CITATION.cff).
+
+Note on bundled software: the *code* in this repository is licensed under
+the MIT License (see LICENSE). Robot URDFs and meshes redistributed in
+assets/ carry their upstream licenses (see assets/*/LICENSE or NOTICE
+files where applicable).

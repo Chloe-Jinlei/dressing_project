@@ -1,0 +1,36 @@
+version: 1
+
+# Sources follow the upstream repository default branch. The local manifest records
+# the requested revision as "default"; users should retain it with experiment outputs.
+sources:
+  upstream_gs_scans:
+    repo_id: shashuo0104/gs-scans
+    repo_type: model
+    archive: gs_scans.zip
+  upstream_phystwin_rope:
+    repo_id: shashuo0104/phystwin-rope
+    repo_type: model
+  upstream_phystwin_sloth:
+    repo_id: shashuo0104/phystwin-toy
+    repo_type: model
+  deformgen_simassets:
+    repo_id: Zili2002/DeformGen-SimAssets
+    repo_type: dataset
+
+cases:
+  rope:
+    gs_dirs: [scene_gripper, rope, clip]
+    physics_source: upstream_phystwin_rope
+    demo_relpath: demos/log/policy_rollouts/rope_act_7000
+    demo_target: log/policy_rollouts/rope_act_7000
+  sloth:
+    gs_dirs: [scene_gripper, sloth, box]
+    physics_source: upstream_phystwin_sloth
+    demo_relpath: demos/log/dataset/teleop_replay_005_sloth_grasp_shift_s5a3f2_segmentxy_keepoffset
+    demo_target: log/dataset/teleop_replay_005_sloth_grasp_shift_s5a3f2_segmentxy_keepoffset
+  cloth3:
+    gs_dirs: [scene_gripper, cloth3]
+    physics_source: deformgen_simassets
+    physics_relpath: cloth3/log/phystwin/cloth3
+    demo_relpath: demos/log/dataset/teleop_run_007_clean_noleading_interp80_trim_norelease
+    demo_target: log/dataset/teleop_run_007_clean_noleading_interp80_trim_norelease
