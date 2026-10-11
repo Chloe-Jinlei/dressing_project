@@ -642,3 +642,200 @@ def test_dashboard_port_preflight_closes_socket(monkeypatch):
     with pytest.raises(lab.DashboardPortError):lab.check_dashboard_port(8765)
     sock.__exit__.assert_called_once()
     sock.bind.assert_called_once_with(('127.0.0.1',8765))
+
+
+@pytest.mark.parametrize('change', [
+    {'left_position_m':[10,0,1]}, {'left_position_m':[.11,0,1]},
+    {'left_quaternion_wxyz':[0,1,0,0]}, {'left_gripper':2},
+    {'left_position_m':[float('nan'),0,1]}, {'particles':[]},
+    {'left_quaternion_wxyz':[0,0,0,0]},
+])
+def test_mppi_rejects_invalid_or_unbounded_goals(visual_loop_scene,change):
+    import dressing_lab as lab
+    Scene,config=visual_loop_scene;robot=Scene().pose()
+    with pytest.raises(ValueError):
+        lab.MPPIGoal.model_validate(robot.model_dump()|change).check_goal(robot,config['control'],config['mppi'])
+
+
+def test_mppi_schema_and_status_contract():
+    import dressing_lab as lab
+    schema=lab.MPPIDecision.output_schema()
+    def visit(node):
+        if isinstance(node,dict):
+            if node.get('type')=='object':
+                assert set(node['required'])==set(node['properties'])
+                assert node['additionalProperties'] is False
+            for child in node.values():visit(child)
+        elif isinstance(node,list):
+            for child in node:visit(child)
+    visit(schema)
+    with pytest.raises(ValueError):lab.MPPIDecision(status='act',goal=None,message='invalid')
+    with pytest.raises(ValueError):lab.MPPIDecision(status='wait',goal=None,message='invalid',actions=[])
+
+
+def test_mppi_receding_horizon_tracks_goal_and_holds_other_arm(visual_loop_scene):
+    import numpy as np
+    import dressing_lab as lab
+    Scene,config=visual_loop_scene;robot=Scene().pose()
+    goal=lab.MPPIGoal.model_validate(robot.model_dump()|{'left_position_m':[.05,.015,1.01]})
+    controller=lab.MPPIController(config['mppi'],config['control'])
+    errors=[]
+    for _ in range(12):
+        action,diagnostics=controller.plan(robot,goal)
+        action.check_control(config['control'])
+        assert action.right_delta_m==[0,0,0]
+        assert action.left_rotation_rad==[0,0,0]
+        assert diagnostics['effective_sample_size']>=1
+        # Deliberate 30% tracking error: controller must replan from measured pose.
+        robot.left_position_m=(np.array(robot.left_position_m)+.7*np.array(action.left_delta_m)).tolist()
+        errors.append(np.linalg.norm(np.array(goal.left_position_m)-robot.left_position_m))
+    assert errors[-1]<.004
+    assert errors[-1]<errors[0]/5
+
+
+def test_mppi_rotation_and_workspace_bounds(visual_loop_scene):
+    import numpy as np
+    import dressing_lab as lab
+    Scene,config=visual_loop_scene;robot=Scene().pose()
+    robot.left_position_m=[.619,0,1]
+    target=robot.model_dump()|{'left_position_m':[.62,.01,1],
+        'left_quaternion_wxyz':[float(np.cos(.1)),0,0,float(np.sin(.1))]}
+    goal=lab.MPPIGoal.model_validate(target).check_goal(robot,config['control'],config['mppi'])
+    action,_=lab.MPPIController(config['mppi'],config['control']).plan(robot,goal)
+    assert .738<=robot.left_position_m[2]+action.left_delta_m[2]<=1.65
+    assert robot.left_position_m[0]+action.left_delta_m[0]<=.62+1e-12
+    assert action.left_rotation_rad[2]>0
+    assert np.linalg.norm(action.left_rotation_rad)<=.1+1e-12
+    assert np.allclose(lab.quaternion_error([1,0,0,0],[-1,0,0,0]),0)
+
+
+def test_mppi_seed_hold_and_cancel(visual_loop_scene):
+    import dressing_lab as lab
+    Scene,config=visual_loop_scene;robot=Scene().pose()
+    goal=lab.MPPIGoal.model_validate(robot.model_dump())
+    a=lab.MPPIController(config['mppi'],config['control'])
+    hold,_=a.plan(robot,goal)
+    assert hold.left_delta_m==hold.right_delta_m==[0,0,0]
+    goal.left_position_m[0]+=.03
+    a.reset();b=lab.MPPIController(config['mppi'],config['control'])
+    c=lab.MPPIController(config['mppi'],config['control'])
+    assert b.plan(robot,goal)[0]==c.plan(robot,goal)[0]
+    with pytest.raises(InterruptedError):a.plan(robot,goal,lambda:True)
+
+
+@pytest.mark.parametrize('setting,value',[('samples',0),('horizon',1.2),('temperature',0),
+    ('noise_sigma',float('nan')),('seed',-1),('iterations',True)])
+def test_mppi_invalid_settings_rejected(visual_loop_scene,setting,value):
+    import dressing_lab as lab
+    _,config=visual_loop_scene
+    with pytest.raises(ValueError):lab.MPPIController(config['mppi']|{setting:value},config['control'])
+
+
+@pytest.mark.parametrize('scenario',['complete','reject','stop'])
+def test_gpt_mppi_shared_loop_feedback_and_recording(tmp_path,monkeypatch,visual_loop_scene,scenario):
+    import json
+    import dressing_lab as lab
+    Scene,config=visual_loop_scene;scene=Scene();config['controller']='gpt-mppi'
+    states=[];packets=[]
+    class Policy:
+        thread_id='mppi-fixture'
+        def __init__(self,*args):pass
+        def cancel(self):pass
+        def decide(self,packet,images,previous_images,step_dir,cancelled):
+            packets.append(packet)
+            assert set(images)==set(lab.DISPLAY_CAMERAS)
+            if len(packets)==1:
+                goal=lab.MPPIGoal.model_validate(packet.robot.model_dump()|{'left_position_m':[.05,0,1]})
+                answer=lab.MPPIDecision(status='act',goal=goal,message='fixture only')
+                lab.atomic_json(step_dir/'decision.json',{'decision':answer.model_dump(),'executed':False})
+                return answer,self.thread_id
+            states[0].closed.set()
+            return lab.MPPIDecision(status='completed',goal=None,message='fixture only'),self.thread_id
+    def serve(state,port):
+        assert port==8766
+        states.append(state);state.url='offline';state.submit('fixture target')
+        return SimpleNamespace(shutdown=Mock(),server_close=Mock())
+    if scenario=='reject':scene.reject_at=3
+    if scenario=='stop':
+        def stop():
+            states[0].finish(reason='fixture_stop');states[0].closed.set()
+        scene.on_step=stop
+    monkeypatch.setattr(lab,'CleanPolicy',Policy);monkeypatch.setattr(lab,'serve_dashboard',serve)
+    lab.run_route_a(config,SimpleNamespace(smoke_test=False,open_browser=False),tmp_path,engine=scene)
+    session=json.loads((tmp_path/'session.json').read_text())
+    batch=json.loads((tmp_path/'steps/000001/execution.json').read_text())
+    assert session['controller']=='gpt-mppi' and session['route']=='B'
+    assert session['prediction_model']=='cartesian_kinematic_v1'
+    assert session['saved'] and session['task_success'] is None
+    assert session['error'] is None
+    plans=sorted((tmp_path/'steps/000001/chunks').glob('*/mppi.json'))
+    assert len(plans)=={'complete':5,'reject':3,'stop':1}[scenario]
+    assert batch['completed_chunks']=={'complete':5,'reject':2,'stop':0}[scenario]
+    for path,(_,before) in zip(plans,scene.plans):
+        record=json.loads(path.read_text())
+        assert record['robot']['left_position_m']==before[:3].tolist()
+    if scenario=='reject':
+        assert packets[1].execution_feedback=='partially_executed'
+        assert packets[1].controller_feedback=='ik_rejected'
+    if scenario=='complete':assert packets[1].execution_feedback=='executed'
+
+
+def test_mppi_cli_preserves_scene_and_selects_controller(monkeypatch):
+    import dressing_lab as lab
+    monkeypatch.setattr(lab.sys,'argv',['dressing','route-a','--controller','gpt-mppi','--simulator','genesis'])
+    monkeypatch.setattr(lab,'check_policy_isolation',Mock())
+    port=Mock();runner=Mock(return_value=False)
+    monkeypatch.setattr(lab,'check_dashboard_port',port)
+    monkeypatch.setattr(lab,'genesis_route_command',runner)
+    lab.main()
+    config,args=runner.call_args.args
+    assert config['controller']=='gpt-mppi'
+    assert config['observation']['cameras']==list(lab.DISPLAY_CAMERAS)
+    port.assert_called_once_with(8766)
+
+
+@pytest.mark.parametrize('scenario',['valid','too_far','hidden_state','action_instead_of_goal'])
+def test_mppi_policy_transport_validates_goal_and_uses_approved_views(tmp_path,monkeypatch,visual_loop_scene,scenario):
+    import io,json
+    import dressing_lab as lab
+    Scene,config=visual_loop_scene;scene=Scene();config['controller']='gpt-mppi'
+    packet=scene.packet('Move slightly',None)
+    goal=packet.robot.model_dump()|{'left_position_m':[.01,0,1]}
+    answer={'status':'act','goal':goal,'message':'test','stage':'move','progress':'observed'}
+    if scenario=='too_far':goal['left_position_m']=[.2,0,1]
+    if scenario=='hidden_state':goal['young_modulus']=8000
+    if scenario=='action_instead_of_goal':
+        answer.pop('goal');answer['actions']=[route_action().model_dump()]*5
+    policy=lab.CleanPolicy(tmp_path,config);step=tmp_path/'steps'/'1';images=[]
+    def command(public,runtime,names):
+        runtime.mkdir(parents=True);images.extend(names)
+        (runtime/'answer.json').write_text(json.dumps(answer))
+        return ['fixture-only']
+    def popen(cmd,**kwargs):
+        kwargs['stdout'].write(json.dumps({'type':'thread.started','thread_id':'fixture-mppi'})+'\n')
+        kwargs['stdout'].write(json.dumps({'type':'turn.completed'})+'\n');kwargs['stdout'].flush()
+        return SimpleNamespace(stdin=io.StringIO(),returncode=0,poll=lambda:0,wait=lambda timeout:0)
+    monkeypatch.setattr(policy,'command',command);monkeypatch.setattr(lab.subprocess,'Popen',popen)
+    if scenario=='valid':
+        result,tid=policy.decide(packet,scene.capture(),None,step,lambda:False)
+        assert isinstance(result,lab.MPPIDecision) and result.goal.left_position_m==[.01,0,1]
+        assert tid=='fixture-mppi'
+    else:
+        with pytest.raises(ValueError):policy.decide(packet,scene.capture(),None,step,lambda:False)
+        assert not (step/'decision.json').exists()
+    assert images==['current-'+camera+'.png' for camera in lab.DISPLAY_CAMERAS]
+    schema=json.loads((step/'public/schema.json').read_text())
+    assert 'goal' in schema['properties'] and 'actions' not in schema['properties']
+    assert json.loads((step/'public/observation.json').read_text())==packet.model_dump()
+
+
+def test_mppi_small_goal_does_not_wander_sideways(visual_loop_scene):
+    import numpy as np
+    import dressing_lab as lab
+    Scene,config=visual_loop_scene;robot=Scene().pose()
+    goal=lab.MPPIGoal.model_validate(robot.model_dump()|{'left_position_m':[.01,0,1]})
+    for seed in range(5):
+        planner=lab.MPPIController(config['mppi']|{'seed':seed},config['control'])
+        action,_=planner.plan(robot,goal)
+        assert .006<action.left_delta_m[0]<.014
+        assert np.linalg.norm(action.left_delta_m[1:])<.002

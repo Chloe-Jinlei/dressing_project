@@ -43,6 +43,25 @@ camera_height = 480
 video_fps = 15
 port = 8765
 
+# Route B shares model, image size, video and task budgets with [route_a].
+# Separate port allows opening either experiment without changing the webpage.
+[mppi]
+port = 8766
+seed = 0
+samples = 512
+horizon = 8
+iterations = 3
+temperature = 0.1
+noise_sigma = 0.35
+tracking_weight = 1.0
+terminal_weight = 8.0
+effort_weight = 0.05
+smoothness_weight = 0.1
+max_goal_translation_m = 0.10
+max_goal_rotation_rad = 0.5
+position_tolerance_m = 0.001
+rotation_tolerance_rad = 0.01
+
 [scene]
 backend = "warp"
 device = "cuda:0"

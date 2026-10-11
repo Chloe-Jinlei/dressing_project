@@ -40,3 +40,13 @@ bash genesis-local/run-dressing.sh
 下级 README 中的 `/home/chloe/`、`~/Desktop/genesis-local` 和 `~/Desktop/bunnylab` 是原机器的历史路径；本仓库请使用上述相对路径。历史运行报告未随仓库全部提供，不能当作本机验证结果。
 
 本机验证（2026-10-10）：RTX 4070 SUPER；Genesis 1.4.3、Python 3.12.14、PyTorch 2.14.0+cu130。控制端 33 项测试通过，Genesis 控制规则 4 项通过（独立 CPU 摩擦积分测试未运行）；bubblewrap 隔离检查通过；CPU/CUDA 各 100 步基础验证与 Franka 离屏渲染通过。实际 CUDA dressing 场景完成 200 步 / 2 秒，五视角正常，状态有限、无桌面穿透且源资产未改动。报告见 `genesis-local/runs/setup-20261010-cuda/report.json`，测试日志见 `bunnylab/runs/setup-20261010/`。这些本机输出不纳入版本控制。本次未调用真实 GPT，也未验证穿衣成功。
+
+GPT + MPPI 对照实验（复用网页、软体和三相机）：
+
+```bash
+cd bunnylab
+uv run dressing route-a --simulator genesis --controller gpt-mppi --open-browser
+```
+
+新模式默认端口 8766，原模式为 8765。当前 MPPI 使用末端运动学预测，
+不预测软体变形或接触；配置、记录和实验边界见 [GPT + MPPI 说明](bunnylab/README.md#gpt--mppi-对照实验路线-b)。
