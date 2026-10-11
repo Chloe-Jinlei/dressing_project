@@ -7,10 +7,11 @@ exec > >(tee -a "$genesis_dir/install.log") 2>&1
 trap 'printf "Installation failed at line %s. See %s/install.log\n" "$LINENO" "$genesis_dir" >&2' ERR
 uv_bin="$genesis_dir/.tools/uv/uv"
 python_bin="$genesis_dir/.venv/bin/python"
+if ! test -x "$uv_bin"; then
+    uv_bin="$(command -v uv)"
+fi
 test -x "$uv_bin"
-test -x "$python_bin"
 test -f "$genesis_dir/genesis-world/pyproject.toml"
-"$python_bin" -c 'import sys; assert sys.version_info[:2] == (3, 12)'
 # Share existing wheel files through hardlinks to avoid duplicating CUDA libraries.
 export UV_CACHE_DIR="$HOME/.cache/uv"
 export UV_NO_CONFIG=1
@@ -18,6 +19,11 @@ export UV_PYTHON_INSTALL_DIR="$genesis_dir/.tools/python"
 export UV_PYTHON_BIN_DIR="$genesis_dir/.tools/bin"
 export UV_PYTHON_INSTALL_BIN=0
 unset UV_TORCH_BACKEND
+# Bootstrap a fresh clone with a Python distribution that includes C headers.
+if ! test -x "$python_bin"; then
+    "$uv_bin" venv --managed-python --python 3.12 "$genesis_dir/.venv"
+fi
+"$python_bin" -c 'import sys; assert sys.version_info[:2] == (3, 12)'
 # Triton compiles a CUDA driver extension and needs the Python C headers.
 if ! "$python_bin" -c 'import sysconfig; from pathlib import Path; assert (Path(sysconfig.get_path("include"))/"Python.h").is_file()'; then
     "$uv_bin" venv --allow-existing --managed-python --python 3.12 "$genesis_dir/.venv"

@@ -629,165 +629,6 @@ def threads_ring(inside, outside, ring):
             "planarity_residual_m": float(singular[-1] / np.sqrt(len(ring)))}
 
 
-class SurfaceContactProjector:
-    """Mass-weighted PBD cloth-sample/body-triangle contact, without pose goals.
-
-    Vertex, edge midpoint and face centroid constraints supplement Genesis' coarse
-    particle contacts. Pinned particles have zero inverse mass. Corrections apply
-    equal and opposite impulses in a sequential constraint solve.
-    """
-
-    def __init__(self, used, body_faces, cloth_faces, cloth_edges, masses, margin=.002):
-        self.used, self.body_faces = used, body_faces
-        self.margin = margin
-        self.masses = masses
-        vertices = np.arange(len(masses["garment"]))
-        self.sample_nodes = np.concatenate([
-            np.repeat(vertices[:, None], 3, axis=1),
-            np.column_stack([cloth_edges, cloth_edges[:, 1]]), cloth_faces])
-        self.sample_weights = np.concatenate([
-            np.tile([1., 0., 0.], (len(vertices), 1)),
-            np.tile([.5, .5, 0.], (len(cloth_edges), 1)),
-            np.full((len(cloth_faces), 3), 1 / 3)])
-
-    def project(self, body, cloth, free, iterations=4):
-        import trimesh
-        body, cloth = body.copy(), cloth.copy()
-        inverse = {name: free[name].astype(float) / self.masses[name] for name in free}
-        count, worst = 0, 0.
-        for _ in range(iterations):
-            mesh = trimesh.Trimesh(body[self.used], self.body_faces, process=False)
-            samples = (cloth[self.sample_nodes] * self.sample_weights[..., None]).sum(1)
-            selected = np.flatnonzero(((samples >= mesh.bounds[0] - self.margin)
-                                      & (samples <= mesh.bounds[1] + self.margin)).all(1))
-            if not len(selected):
-                break
-            closest, _, triangles = trimesh.proximity.closest_point(mesh, samples[selected])
-            weights = trimesh.triangles.points_to_barycentric(mesh.triangles[triangles], closest)
-            normals = (mesh.vertex_normals[mesh.faces[triangles]] * weights[..., None]).sum(1)
-            normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
-            gap = np.einsum("ij,ij->i", samples[selected] - closest, normals) - self.margin
-            active = gap < -1e-6
-            if not active.any():
-                break
-            selected, triangles, weights, normals, gap = (
-                value[active] for value in (selected, triangles, weights, normals, gap))
-            count += len(selected)
-            worst = max(worst, float(-gap.min()))
-            cn, cw = self.sample_nodes[selected], self.sample_weights[selected]
-            bn, bw = self.used[self.body_faces[triangles]], weights
-            ci, bi = inverse["garment"][cn], inverse["sloth"][bn]
-            denominator = (ci * cw ** 2).sum(1) + (bi * bw ** 2).sum(1)
-            for k in range(len(selected)):
-                separation = np.dot((cloth[cn[k]] * cw[k, :, None]).sum(0)
-                                    - (body[bn[k]] * bw[k, :, None]).sum(0), normals[k])
-                violation = self.margin - separation
-                if violation <= 0 or denominator[k] < 1e-12:
-                    continue
-                impulse = min(violation, .003) / denominator[k] * normals[k]
-                np.add.at(cloth, cn[k], (ci[k] * cw[k])[:, None] * impulse)
-                np.add.at(body, bn[k], -(bi[k] * bw[k])[:, None] * impulse)
-        return body, cloth, {"active_constraints": count, "largest_contact_violation_m": worst}
-
-
-@qd.data_oriented
-class SubstepSurfaceContacts:
-    """Cached sampled triangle contacts interleaved with native PBD constraints."""
-
-    def __init__(self, projector, objects, edges, rest_lengths):
-        self.projector, self.objects = projector, objects
-        self.solver = objects["sloth"].solver
-        self.native_volume = self.solver._kernel_solve_volume
-        self.cache = None
-        self.count = 0
-        self.iterations = 4
-        self.limits = np.full(self.solver.n_particles, np.inf)
-        for name, entity in objects.items():
-            lengths = np.full(entity.n_particles, np.inf)
-            np.minimum.at(lengths, edges[name][:, 0], rest_lengths[name])
-            np.minimum.at(lengths, edges[name][:, 1], rest_lengths[name])
-            self.limits[entity.particle_start:entity.particle_end] = np.minimum(.0003, lengths * .1)
-        self.solver._kernel_solve_volume = self.solve
-
-    def refresh(self, body, cloth):
-        import torch
-        import trimesh
-        p = self.projector
-        mesh = trimesh.Trimesh(body[p.used], p.body_faces, process=False)
-        samples = (cloth[p.sample_nodes] * p.sample_weights[..., None]).sum(1)
-        selected = np.flatnonzero(((samples >= mesh.bounds[0] - .012)
-                                  & (samples <= mesh.bounds[1] + .012)).all(1))
-        if len(selected):
-            closest, distance, triangles = trimesh.proximity.closest_point(mesh, samples[selected])
-            weights = trimesh.triangles.points_to_barycentric(mesh.triangles[triangles], closest)
-            normals = (mesh.vertex_normals[mesh.faces[triangles]] * weights[..., None]).sum(1)
-            normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
-            signed = np.einsum("ij,ij->i", samples[selected] - closest, normals)
-            valid = (distance < .012) | (signed < 0)
-            selected, triangles, weights, normals = (value[valid] for value in (selected, triangles, weights, normals))
-        self.count = len(selected)
-        if not self.count:
-            self.cache = None
-            return
-        cn = p.sample_nodes[selected] + self.objects["garment"].particle_start
-        bn = p.used[p.body_faces[triangles]] + self.objects["sloth"].particle_start
-        cw = p.sample_weights[selected]
-        counts = np.bincount(np.concatenate([cn[cw > 1e-10], bn[weights > 1e-10]]), minlength=self.solver.n_particles)
-        values = [cn, cw, bn, weights, normals, self.limits, counts]
-        self.cache = [torch.as_tensor(np.ascontiguousarray(value), device=gs.device,
-                                     dtype=gs.tc_int if i in (0, 2, 6) else gs.tc_float)
-                      for i, value in enumerate(values)]
-
-    def solve(self, f):
-        self.native_volume(f)
-        if self.cache is not None:
-            for _ in range(self.iterations):
-                self.project(*self.cache)
-                self.solver._kernel_solve_stretch(f)
-                self.native_volume(f)
-            # A bounded final contact pass keeps surface clearance after the volume solve.
-            self.project(*self.cache)
-
-    @qd.kernel
-    def project(self, cn: qd.types.ndarray(), cw: qd.types.ndarray(),
-                bn: qd.types.ndarray(), bw: qd.types.ndarray(), normals: qd.types.ndarray(),
-                limits: qd.types.ndarray(), counts: qd.types.ndarray()):
-        for k in range(cn.shape[0]):
-            cpos = qd.Vector.zero(gs.qd_float, 3)
-            bpos = qd.Vector.zero(gs.qd_float, 3)
-            normal = qd.Vector.zero(gs.qd_float, 3)
-            denominator = gs.qd_float(0.)
-            max_multiplier = gs.qd_float(1e9)
-            for j in qd.static(range(3)):
-                ci, bi = cn[k, j], bn[k, j]
-                cweight = self.solver.particles[ci, 0].free / self.solver.particles_info[ci].mass
-                bweight = self.solver.particles[bi, 0].free / self.solver.particles_info[bi].mass
-                cpos += cw[k, j] * self.solver.particles[ci, 0].pos
-                bpos += bw[k, j] * self.solver.particles[bi, 0].pos
-                denominator += cweight * cw[k, j] ** 2 + bweight * bw[k, j] ** 2
-                if cweight * cw[k, j] > 1e-12:
-                    max_multiplier = qd.min(max_multiplier, limits[ci] / (cweight * cw[k, j] * qd.max(counts[ci], 1)))
-                if bweight * bw[k, j] > 1e-12:
-                    max_multiplier = qd.min(max_multiplier, limits[bi] / (bweight * bw[k, j] * qd.max(counts[bi], 1)))
-                normal[j] = normals[k, j]
-            violation = .002 - (cpos - bpos).dot(normal)
-            if violation > 0 and denominator > 1e-12:
-                multiplier = qd.min(violation / denominator, max_multiplier)
-                for j in qd.static(range(3)):
-                    ci, bi = cn[k, j], bn[k, j]
-                    cweight = self.solver.particles[ci, 0].free / self.solver.particles_info[ci].mass
-                    bweight = self.solver.particles[bi, 0].free / self.solver.particles_info[bi].mass
-                    self.solver.particles[ci, 0].dpos += cweight * cw[k, j] * multiplier * normal
-                    self.solver.particles[bi, 0].dpos -= bweight * bw[k, j] * multiplier * normal
-        for i in range(self.solver.n_particles):
-            if self.solver.particles[i, 0].free:
-                self.solver.particles[i, 0].pos += self.solver.particles[i, 0].dpos
-            self.solver.particles[i, 0].dpos.fill(0.)
-
-    def close(self):
-        self.solver._kernel_solve_volume = self.native_volume
-
-
 class DressingExperiment(LiftExperiment):
     """Lift first, then insert through a robot-opened hem with the table as support."""
 
@@ -820,41 +661,14 @@ class DressingExperiment(LiftExperiment):
         }
         self.report["limitations"][0] = "Scripted dressing attempt. Completion requires torso enclosure and head/arm threading checks; render coverage alone is not success."
         self.in_dressing = False
-        from dressing_scene import tetra_boundary
-        with np.load(self.run / "assets" / "physics_meshes.npz") as physics:
-            used, body_faces = tetra_boundary(self.rest, physics["sloth_tetra"])
-        masses = {}
-        solver = self.objects["sloth"].solver
-        global_masses = solver.particles_info.mass.to_numpy()
-        for name, entity in self.objects.items():
-            masses[name] = global_masses[entity.particle_start:entity.particle_end].reshape(-1)
-        self.surface_contacts = SurfaceContactProjector(used, body_faces, self.cloth_faces, self.cloth_edges, masses)
-        self.substep_contacts = SubstepSurfaceContacts(self.surface_contacts, self.objects,
-                            {"sloth": self.edges, "garment": self.cloth_edges},
-                            {"sloth": self.rest_lengths, "garment": self.cloth_rest_lengths})
         self.dress.update(object_position_setters_used=False,
                           object_target_pose_setters_used=False,
                           tabletop_friction=self.report["rigid_pbd_contact"],
-                          surface_contact_solver={"method": "mass-weighted sampled triangle contacts interleaved with native PBD stretch and volume constraints",
-                                                  "clearance_m": .002, "iterations_per_physics_substep": 4,
-                                                  "cache_refresh_period_s": self.dt, "broadphase_distance_m": .012,
-                                                  "direct_solver_particle_corrections": True,
-                                                  "maximum_vertex_correction_per_pass_m": .0003,
-                                                  "edge_relative_correction_limit": .1})
-        self.report["limitations"].append("Sampled body surface contacts are cached every control step and interleaved with native stretch/volume constraints at every physics substep. Additional solver iterations change numerical convergence; materials remain uncalibrated. This is not continuous triangle collision detection.")
-
-    def before_physics_step(self):
-        self.substep_contacts.refresh(array(self.objects["sloth"].get_particles_pos()),
-                                      array(self.objects["garment"].get_particles_pos()))
+                          surface_contact_solver=dict(self.report["surface_contact"]))
 
     def after_physics_step(self):
-        # Rigid/PBD friction is now solved inside each physical substep. Do not
-        # apply the old gravity-based velocity friction a second time here.
-        self.dress["surface_contact_solver"]["latest_cached_constraint_count"] = self.substep_contacts.count
-
-    def close(self):
-        self.substep_contacts.close()
-        super().close()
+        self.dress["surface_contact_solver"]["peak_constraints"] = (
+            self.objects["sloth"].solver.surface_contacts.peak_constraints)
 
     def start_phase(self, name):
         if self.in_dressing:

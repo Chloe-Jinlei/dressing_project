@@ -22,7 +22,8 @@ import fast_simplification
 import numpy as np
 import trimesh
 from PIL import Image
-from genesis_mesh_adapter import existing_pbd_mesh, simulation_connectivity, install_rigid_pbd_friction
+from genesis_mesh_adapter import (existing_pbd_mesh, simulation_connectivity, install_rigid_pbd_friction,
+                                  install_cotton_solver, apply_cotton_parameters, install_surface_contacts)
 
 HERE = Path(__file__).resolve().parent
 
@@ -150,6 +151,14 @@ def prepare_assets(project, run):
     garment = garment[:, [1, 0, 2]]
     garment[:, 0] *= -1
     garment_area = float(trimesh.Trimesh(vertices=garment, faces=faces, process=False).area)
+    # Genesis cotton mass comes from measured areal density and actual two-sided
+    # garment surface area; scene.garment.mass remains the MuJoCo legacy setting.
+    cotton = sc.get("genesis", {}).get("garment_material")
+    if cotton:
+        density = cotton["areal_density_kg_m2"]
+        if not np.isfinite(density) or density <= 0:
+            raise ValueError("Cotton areal density must be positive and finite")
+        sc["garment"]["mass"] = density * garment_area
 
     prepared = run / "assets"
     prepared.mkdir()
@@ -187,7 +196,7 @@ def prepare_assets(project, run):
             "Scene migration/settling only; no policy, grasping, or dressing success evaluation.",
             "A version-checked pre-build adapter for Genesis 1.4.3 bypasses PBD remeshing; it uses the same 551 sloth vertices/2549 tetrahedra and the same simplified MuJoCo garment mesh.",
             "The original sloth tetra exterior has one non-manifold edge; it is retained rather than repaired or substituted.",
-            "PBD compliance values are uncalibrated Genesis priors; they are not a conversion of MuJoCo Young's modulus/Poisson ratio/damping.",
+            "Cotton areal density and bending rigidity use published measurements; isotropic membrane stiffness, drag and contact are approximations, not specimen calibration. Sloth PBD properties are uncalibrated soft-toy priors.",
             "MJCF finger tendon actuation is approximated by two joint position controllers in Genesis.",
             "The shared PBD particle diameter differs from the two MuJoCo vertex collision radii and garment thickness.",
             "PBD self-contact is particle-based and ignores pairs closer than a particle diameter in the rest pose; it is not continuous cloth self-contact.",
@@ -217,7 +226,7 @@ def build_scene(config, paths, prepared, report, args):
         pbd_options=gs.options.PBDOptions(
             particle_size=args.particle_size,
             max_stretch_solver_iterations=8, max_bending_solver_iterations=4,
-            max_volume_solver_iterations=8,
+            max_volume_solver_iterations=32,
             lower_bound=(-1.5, -1.5, 0), upper_bound=(1.5, 1.5, 2.5)),
         viewer_options=gs.options.ViewerOptions(
             res=(args.width, args.height), camera_pos=overview["position"],
@@ -225,6 +234,9 @@ def build_scene(config, paths, prepared, report, args):
             refresh_rate=30),
         show_viewer=not args.headless,
     )
+    cotton = sc.get("genesis", {}).get("garment_material")
+    if cotton:
+        install_cotton_solver(scene)
     report["rigid_pbd_contact"] = install_rigid_pbd_friction(scene)
     static_material = gs.materials.Rigid(needs_coup=True, friction=.7, coup_friction=.7)
 
@@ -278,6 +290,8 @@ def build_scene(config, paths, prepared, report, args):
             **sloth_soft_body),
         "garment": gs.materials.PBD.Cloth(
             rho=garment_density, stretch_compliance=1e-7, bending_compliance=1e-5,
+            **({"stretch_relaxation": cotton["stretch_relaxation"],
+                "bending_relaxation": cotton["bending_relaxation"]} if cotton else {}),
             static_friction=sc["garment"]["friction"], kinetic_friction=sc["garment"]["friction"]),
     }
     deformables = {}
@@ -322,6 +336,11 @@ def build_scene(config, paths, prepared, report, args):
             pos=(.15, -.95, 1.25), lookat=(-.18, -.08, .97), fov=43)
     print("Building Genesis scene (first run compiles kernels)...", flush=True)
     scene.build()
+    if cotton:
+        report["cotton_material"] = apply_cotton_parameters(deformables["garment"], cotton)
+        used, boundary = tetra_boundary(physics["sloth_points"], physics["sloth_tetra"])
+        report["surface_contact"] = install_surface_contacts(deformables, used[boundary],
+            sc["genesis"]["surface_contact"])
     report["fidelity_checks"] = {}
     for name, entity in deformables.items():
         actual_points = entity.get_particles_pos().detach().cpu().numpy()
@@ -373,6 +392,14 @@ def positions_stats(deformables, table_height):
                        "rms_speed_m_s": float(np.sqrt(np.mean(np.sum(v * v, axis=1)))),
                        "max_speed_m_s": float(np.linalg.norm(v, axis=1).max()),
                        "table_penetration_m": float(max(0, table_height - p[:, 2].min()))}
+        if name == "sloth":
+            tet = entity._elems
+            volumes = np.linalg.det(p[tet[:, 1:]]-p[tet[:, :1]])/6
+            collapsed = int(np.count_nonzero(volumes <= 0))
+            result[name].update(volume_ratio=float(volumes.sum()/entity._elems_vol_rest.sum()),
+                                inverted_or_collapsed_tetrahedra=collapsed)
+            if collapsed:
+                raise RuntimeError(f"Sloth has {collapsed} inverted or collapsed tetrahedra")
     return result
 
 

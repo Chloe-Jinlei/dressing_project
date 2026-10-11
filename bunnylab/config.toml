@@ -33,7 +33,11 @@ workspace_max = [0.62, 0.45, 1.65]
 [route_a]
 model = "gpt-6-astra"
 decision_timeout_seconds = 180
-max_steps = 100
+max_steps = 600
+max_wall_seconds = 1800
+max_consecutive_failures = 5
+max_no_progress_rounds = 8
+wait_seconds = 1.0
 camera_width = 640
 camera_height = 480
 video_fps = 15
@@ -78,10 +82,32 @@ request_timeout_seconds = 120
 [scene.genesis.sloth_material]
 # PBD.Elastic volumetric soft body. Larger compliance permits more deformation.
 # These are Genesis parameters, not a conversion of MuJoCo Young's modulus.
-stretch_compliance = 0.005
-volume_compliance = 1e-12
+# Soft stuffed-toy approximation; not calibrated to a physical specimen.
+stretch_compliance = 0.02
+volume_compliance = 1e-14
 stretch_relaxation = 0.3
-volume_relaxation = 0.3
+volume_relaxation = 0.05
+
+[scene.genesis.garment_material]
+# Cotton A, Table 3, https://doi.org/10.3390/robotics5020010
+# Measured 0.0211 g/cm² and 0.0567 gf cm²/cm; SI conversion below.
+areal_density_kg_m2 = 0.211
+bending_rigidity_nm = 0.00000556036655
+# Isotropic membrane surrogate, NOT a measured tensile value for Cotton A.
+# Kept independent of bending: cotton fibres resist stretch but fabric folds.
+membrane_stiffness_n_m = 600.0
+stretch_relaxation = 0.2
+bending_relaxation = 0.2
+# Drag F = 0.5*rho_air*Cd*vertex_area*|v|v; Cd is an approximation.
+air_density_kg_m3 = 1.225
+drag_coefficient = 1.0
+source = "https://doi.org/10.3390/robotics5020010 (Table 3, Cotton A)"
+
+[scene.genesis.surface_contact]
+clearance_m = 0.001
+iterations = 12
+max_constraints = 32768
+max_correction_m = 0.002
 
 [scene.garment]
 position_xy = [0.18, -0.08]

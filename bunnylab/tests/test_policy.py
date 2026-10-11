@@ -161,24 +161,26 @@ def test_human_exit_is_idempotent_and_blocks_new_commands(tmp_path):
     with pytest.raises(ValueError):state.submit("keep moving")
 
 
-def test_task_judgement_records_result_without_ending_experiment(tmp_path):
+def test_single_goal_human_judgement_and_restart(tmp_path):
     import json
-    from dressing_lab import ExperimentState
+    from dressing_lab import ExperimentState,atomic_json
     state=ExperimentState(tmp_path,"test-model")
     with pytest.raises(ValueError):state.judge("success")
-    first=state.submit("Lift the sloth")
-    state.thread_id="same-experiment"
-    revision=state.judge("success")
-    assert revision>first and not state.stop.is_set() and not state.closed.is_set()
-    assert state.status()["awaiting_instruction"] and state.status()["task_outcome"]=="success"
-    assert state.judge("success")==revision and len(state.task_results)==1
-    with pytest.raises(ValueError):state.judge("failure")
-    state.submit("Now lift the shirt")
-    assert not state.awaiting_instruction and state.task_outcome=="unjudged"
-    assert state.thread_id=="same-experiment" and state.outcome=="unjudged"
-    assert json.loads((tmp_path/"task_results.json").read_text())[0]["instruction"]=="Lift the sloth"
-    state.finish()
+    state.submit("Dress the sloth")
+    with pytest.raises(ValueError):state.submit("Replace the goal")
+    with pytest.raises(ValueError):state.restart()
+    state.model_claim="completed";state.finish(reason="model_completed")
+    assert state.outcome=="unjudged"
+    atomic_json(tmp_path/"session.json",{"task_success":None,"model_claim":"completed"})
+    state.saved=True;state.finalized=True
+    state.judge("failure")
+    assert state.stop.is_set() and not state.closed.is_set()
+    assert state.judge("failure")==state.revision and len(state.task_results)==1
     with pytest.raises(ValueError):state.judge("success")
+    saved=json.loads((tmp_path/"session.json").read_text())
+    assert saved["task_success"] is False and saved["model_claim"]=="completed"
+    state.restart()
+    assert state.restart_requested and state.closed.is_set()
 
 
 def test_decision_schema_distinguishes_wait_and_action():
@@ -246,6 +248,7 @@ def test_genesis_cli_uses_same_route_a_without_initializing_warp(monkeypatch):
     monkeypatch.setattr(dressing_lab,"genesis_route_command",genesis)
     monkeypatch.setattr(dressing_lab,"scene_command",mujoco)
     monkeypatch.setattr(dressing_lab,"check_policy_isolation",Mock())
+    monkeypatch.setattr(dressing_lab,"check_dashboard_port",Mock())
     monkeypatch.setattr(dressing_lab.sys,"argv",["dressing","route-a","--simulator","genesis","--genesis-device","cpu"])
     dressing_lab.main()
     genesis.assert_called_once();mujoco.assert_not_called()
@@ -262,7 +265,7 @@ def test_backend_observation_allowlist_rejects_particle_and_material_fields():
     calibration={name:camera for name in DISPLAY_CAMERAS}
     packet=make_policy_packet(pose,calibration,"move 1 cm",None,config)
     assert set(packet.model_dump())=={"task","robot","previous_action","previous_images_available",
-        "coordinate_system","camera_calibration","action_limits","execution_feedback","chunk_execution"}
+        "coordinate_system","camera_calibration","action_limits","execution_feedback","chunk_execution","controller_feedback"}
     with pytest.raises(ValidationError):
         make_policy_packet(pose,calibration|{"overhead":camera|{"particles":[[0,0,1]]}},"test",None,config)
     with pytest.raises(ValidationError):
@@ -354,7 +357,7 @@ def test_common_visual_loop_preserves_conversation_feedback_and_videos(tmp_path,
     assert all((tmp_path/name).stat().st_size>0 for name in ("overhead.mp4","wrist.mp4","table_side.mp4","dual.mp4","triple.mp4"))
 
 
-@pytest.mark.parametrize("scenario", ["complete", "reject", "stop", "revision"])
+@pytest.mark.parametrize("scenario", ["complete", "reject", "stop"])
 def test_five_chunks_execute_sequentially_and_cancel_remaining(tmp_path,monkeypatch,visual_loop_scene,scenario):
     import json
     import numpy as np
@@ -385,7 +388,7 @@ def test_five_chunks_execute_sequentially_and_cancel_remaining(tmp_path,monkeypa
     scene.on_step=interrupt
     if scenario=="reject":
         scene.reject_at=3
-        scene.on_reject=lambda:states[0].submit("New instruction after rejected chunk")
+        scene.on_reject=None
     monkeypatch.setattr(lab,"CleanPolicy",Policy);monkeypatch.setattr(lab,"serve_dashboard",serve)
     lab.run_route_a(config,SimpleNamespace(smoke_test=False,open_browser=False),tmp_path,engine=scene)
     session=json.loads((tmp_path/"session.json").read_text())
@@ -423,88 +426,100 @@ def test_five_chunks_execute_sequentially_and_cancel_remaining(tmp_path,monkeypa
         else:assert len(packets)==1
 
 
-@pytest.mark.parametrize("judge_at", ["thinking", "executing", "completed"])
-def test_task_judgement_pauses_and_next_task_keeps_scene_and_conversation(tmp_path,monkeypatch,visual_loop_scene,judge_at):
+@pytest.mark.parametrize("scenario", ["completed", "unable", "wait", "reject_retry", "errors", "budget", "stall", "deadline", "human", "deadline_executing", "human_executing", "schema_error"])
+def test_autonomous_goal_termination_and_feedback(tmp_path,monkeypatch,visual_loop_scene,scenario):
     import json
-    import numpy as np
     import dressing_lab as lab
     TestScene,config=visual_loop_scene
-    config["route_a"]["max_steps"]=5
-    scene=TestScene();states=[];packets=[];judged_poses=[];holds_at_judgement=[];policies=[]
-    first_steps={"thinking":0,"executing":20,"completed":500}[judge_at]
-
-    def judge_current():
-        judged_poses.append(scene.values.copy());holds_at_judgement.append(scene.holds)
-        states[0].judge("success")
-        assert not states[0].stop.is_set() and not states[0].closed.is_set()
-
+    scene=TestScene();states=[];packets=[]
+    config["route_a"].update(max_steps=10,max_consecutive_failures=2,max_no_progress_rounds=2)
+    if scenario=="reject_retry":scene.reject_at=1
+    if scenario=="deadline":config["route_a"]["max_wall_seconds"]=.05
+    def interrupt_action():
+        if len(scene.step_history)==20:
+            if scenario=="deadline_executing":states[0].task_started=lab.time.monotonic()-1801
+            elif scenario=="human_executing":states[0].judge("failure")
+    scene.on_step=interrupt_action
     class Policy:
-        thread_id="same-multi-task-experiment"
-        def __init__(self,*args):policies.append(self);self.memory=None
+        thread_id="one-autonomous-thread"
+        def __init__(self,*args):pass
         def cancel(self):pass
         def decide(self,packet,images,previous_images,step_dir,cancelled):
             packets.append(packet)
-            if self.memory is None:
-                self.memory="Lift the sloth"
-                if judge_at=="thinking":judge_current()
-                action=route_action(left_delta_m=[.001,0,0])
-            else:
-                assert self.memory=="Lift the sloth"
-                assert "Now lift the shirt" in packet.task
-                assert "Human result for user instruction 1: success" in packet.task
-                np.testing.assert_allclose(scene.values,judged_poses[0])
-                action=route_action(left_delta_m=[0,0,0],right_delta_m=[.002,0,0])
-            answer=lab.RouteADecision(status="act",actions=[action]*5,message="fixture only")
-            lab.atomic_json(step_dir/"decision.json",{"decision":answer.model_dump(),"executed":False})
+            if scenario=="schema_error":raise lab.PolicyCallError("invalid_json_schema","模型输出格式错误",False)
+            if scenario=="errors":raise TimeoutError("private internal path must not reach next packet")
+            if scenario=="deadline":
+                while not cancelled():lab.time.sleep(.005)
+                raise InterruptedError()
+            if scenario=="human":
+                states[0].judge("failure")
+                return lab.RouteADecision(status="act",actions=[route_action()]*5,message="stale"),self.thread_id
+            status=scenario if scenario in ("completed","unable") else "act"
+            if scenario=="wait":status="wait" if len(packets)==1 else "completed"
+            if scenario=="reject_retry" and len(packets)==3:status="completed"
+            action=route_action(left_delta_m=[0,0,0] if scenario=="stall" else [.001,0,0])
+            answer=lab.RouteADecision(status=status,actions=[action]*5 if status=="act" else None,
+                message="fixture",stage="dress",progress="visual evidence only")
+            lab.atomic_json(step_dir/"decision.json",{"decision":answer.model_dump()})
             return answer,self.thread_id
-
+    class Recorder:
+        error=None
+        def __init__(self,state,config):self.state=state
+        def close(self):
+            self.state.closed.set()
+            return {"fixture":True}
     def serve(state,port):
-        states.append(state);state.url="offline-multi-task-fixture";state.submit("Lift the sloth")
+        states.append(state);state.url="fixture";state.submit("Help the sloth put on the shirt")
         return SimpleNamespace(shutdown=Mock(),server_close=Mock())
-
-    def on_step():
-        count=len(scene.step_history)
-        if first_steps and count==first_steps and not states[0].task_results:judge_current()
-        elif count==first_steps+500 and len(states[0].task_results)==1:judge_current()
-
-    original_capture=scene.capture
-    def capture():
-        if states and states[0].awaiting_instruction and states[0].task_results:
-            stage=len(states[0].task_results)
-            if scene.holds>holds_at_judgement[-1]:
-                assert not states[0].stop.is_set()
-                np.testing.assert_allclose(scene.values,judged_poses[-1])
-                if stage==1:states[0].submit("Now lift the shirt")
-                else:
-                    states[0].finish(reason="fixture_multi_task_complete");states[0].closed.set()
-        return original_capture()
-
-    scene.on_step=on_step;scene.capture=capture
     monkeypatch.setattr(lab,"CleanPolicy",Policy);monkeypatch.setattr(lab,"serve_dashboard",serve)
-    lab.run_route_a(config,SimpleNamespace(smoke_test=False,open_browser=False),tmp_path,engine=scene)
-    session=json.loads((tmp_path/"session.json").read_text())
-    results=json.loads((tmp_path/"task_results.json").read_text())
-    assert len(policies)==1 and len(packets)==2
-    assert session["thread_id"]=="same-multi-task-experiment" and session["error"] is None
-    assert session["task_success"] is None and session["human_outcome"]=="unjudged"
-    assert session["task_results"]==results and [r["instruction_index"] for r in results]==[1,2]
-    assert all(r["human_outcome"]=="success" for r in results)
-    assert scene.time==pytest.approx(2+first_steps*.01+5)
-    assert scene.values[0]==pytest.approx(judged_poses[0][0])
-    assert scene.values[3]==pytest.approx(.11)
-    if judge_at=="thinking":
-        assert len(scene.plans)==5 and packets[1].previous_action is None
-        assert packets[1].execution_feedback=="not_executed"
+    monkeypatch.setattr(lab,"VideoRecorder",Recorder)
+    if scenario=="schema_error":
+        with pytest.raises(RuntimeError,match="模型输出格式错误"):
+            lab.run_route_a(config,SimpleNamespace(smoke_test=False,open_browser=False),tmp_path,engine=scene)
     else:
+        lab.run_route_a(config,SimpleNamespace(smoke_test=False,open_browser=False),tmp_path,engine=scene)
+    record=json.loads((tmp_path/"session.json").read_text())
+    expected={"completed":"model_completed","unable":"model_unable","wait":"model_completed",
+        "reject_retry":"model_completed","errors":"consecutive_failures","budget":"action_budget_limit",
+        "stall":"no_observable_change","deadline":"wall_time_limit","human":"human_judgement",
+        "deadline_executing":"wall_time_limit","human_executing":"human_judgement","schema_error":"policy_configuration_error"}
+    assert record["ended_by"]==expected[scenario]
+    assert record["task_success"] is (False if scenario.startswith("human") else None)
+    assert record["automatic_success"] is None and record["saved"]
+    assert all(packet.task=="Help the sloth put on the shirt" for packet in packets)
+    if scenario=="wait":
+        assert len(packets)==2 and scene.time==pytest.approx(3.)
+        assert packets[1].controller_feedback=="observation_wait"
+    if scenario=="reject_retry":
+        assert packets[1].controller_feedback=="ik_rejected"
+        assert packets[1].execution_feedback=="not_executed"
+        assert packets[2].execution_feedback=="executed" and len(scene.plans)==6
+    if scenario=="errors":
+        assert len(packets)==2 and packets[1].controller_feedback=="policy_error"
+        assert "private internal" not in packets[1].model_dump_json()
+    if scenario in ("deadline","human"):assert not scene.plans
+    if scenario.endswith("_executing"):
+        assert len(scene.plans)==1 and scene.time==pytest.approx(2.2)
         batch=json.loads((tmp_path/"steps/000001/execution.json").read_text())
-        assert packets[1].previous_action is not None
-        if judge_at=="executing":
-            assert batch["interrupted_reason"]=="human_judgement" and len(scene.plans)==6
-            assert packets[1].execution_feedback=="partially_executed"
-            assert batch["chunks"][0]["executed_simulation_seconds"]==pytest.approx(.2)
-        else:
-            assert len(scene.plans)==10 and packets[1].execution_feedback=="executed"
-    assert all((tmp_path/name).stat().st_size>0 for name in ("triple.mp4","dual.mp4","overhead.mp4","wrist.mp4","table_side.mp4"))
+        assert batch["executed_chunks"]==1 and batch["completed_chunks"]==0
+    if scenario=="schema_error":
+        assert len(packets)==1 and not scene.plans
+        assert record["error"]=="模型输出格式错误" and "模型输出格式错误" in states[0].message
+    if scenario=="budget":assert record["executed_actions"]==10
+
+
+def test_cli_new_experiment_rebuilds_and_does_not_open_duplicate_tab(monkeypatch):
+    import dressing_lab as lab
+    calls=[]
+    def runner(config,args):
+        calls.append(args.open_browser)
+        return len(calls)==1
+    monkeypatch.setattr(lab,"genesis_route_command",runner)
+    monkeypatch.setattr(lab,"check_policy_isolation",lambda:None)
+    monkeypatch.setattr(lab,"check_dashboard_port",lambda port:None)
+    monkeypatch.setattr(lab.sys,"argv",["dressing","route-a","--simulator","genesis","--open-browser"])
+    lab.main()
+    assert calls==[True,False]
 
 
 def test_every_chunk_is_checked_before_execution():
@@ -543,3 +558,87 @@ def test_dashboard_serves_side_view_and_exact_video_paths(tmp_path,monkeypatch):
     assert get('/video/triple.mp4')==(200,b'three-view-fixture')
     assert get('/video/../config.toml')[0]==404
     assert get('/private/genesis/scene/report.json')[0]==404
+
+
+def test_dashboard_refresh_does_not_terminate_task():
+    from dressing_lab import DASHBOARD
+    assert "pagehide" not in DASHBOARD and "sendBeacon" not in DASHBOARD
+    assert "post('/restart'" in DASHBOARD and "post('/close'" in DASHBOARD
+
+
+def test_terminal_policy_statuses_require_no_actions():
+    from dressing_lab import RouteADecision
+    for status in ("completed","unable"):
+        assert RouteADecision(status=status,actions=None,message="evidence").status==status
+        with pytest.raises(ValidationError):RouteADecision(status=status,actions=[route_action()]*5,message="")
+
+
+def test_exported_policy_schema_requires_all_fields_recursively():
+    from dressing_lab import RouteADecision
+    schema=RouteADecision.output_schema()
+    assert {'stage','progress'}<=set(schema['required'])
+    def check(node):
+        if isinstance(node,dict):
+            assert 'default' not in node
+            if node.get('type')=='object':
+                assert set(node['required'])==set(node['properties'])
+                assert node['additionalProperties'] is False
+            for child in node.values():check(child)
+        elif isinstance(node,list):
+            for child in node:check(child)
+    check(schema)
+    actions=next(option for option in schema['properties']['actions']['anyOf'] if option['type']=='array')
+    assert actions['minItems']==actions['maxItems']==5
+
+
+@pytest.mark.parametrize('nested',[False,True])
+def test_cli_schema_error_is_classified_as_non_retryable(tmp_path,nested):
+    import json
+    from dressing_lab import policy_process_error
+    error={'error':{'code':'invalid_json_schema','message':"Missing 'stage'."},'status':400}
+    event={'type':'turn.failed','error':{'message':json.dumps(error)}} if nested else {'type':'error',**error}
+    path=tmp_path/'events.jsonl';path.write_text(json.dumps(event)+'\n')
+    result=policy_process_error(path,1)
+    assert result.code=='invalid_json_schema' and not result.retryable
+    assert 'invalid_json_schema' in str(result)
+
+
+def test_unknown_process_error_remains_retryable_without_echoing_server_text(tmp_path):
+    from dressing_lab import policy_process_error
+    path=tmp_path/'events.jsonl';path.write_text('{"type":"error","message":"private server detail"}\n')
+    result=policy_process_error(path,1)
+    assert result.retryable and 'private server detail' not in str(result)
+
+
+def test_busy_dashboard_port_prevents_simulation_start(monkeypatch,capsys):
+    import dressing_lab as lab
+    engine=Mock()
+    monkeypatch.setattr(lab,'check_policy_isolation',lambda:None)
+    monkeypatch.setattr(lab,'check_dashboard_port',Mock(side_effect=lab.DashboardPortError(8765)))
+    monkeypatch.setattr(lab,'genesis_route_command',engine)
+    monkeypatch.setattr(lab.sys,'argv',['dressing','route-a','--simulator','genesis'])
+    with pytest.raises(SystemExit) as error:lab.main()
+    assert error.value.code==2
+    engine.assert_not_called()
+    message=capsys.readouterr().err
+    assert '8765' in message and '保存并退出服务' in message and 'Traceback' not in message
+
+
+def test_busy_dashboard_bind_race_has_clear_error(tmp_path,monkeypatch):
+    import errno,http.server
+    import dressing_lab as lab
+    monkeypatch.setattr(http.server,'ThreadingHTTPServer',Mock(side_effect=OSError(errno.EADDRINUSE,'in use')))
+    with pytest.raises(lab.DashboardPortError,match='8765'):
+        lab.serve_dashboard(lab.ExperimentState(tmp_path,'test'),8765)
+
+
+def test_dashboard_port_preflight_closes_socket(monkeypatch):
+    import errno,socket
+    import dressing_lab as lab
+    sock=Mock()
+    sock.__enter__=Mock(return_value=sock);sock.__exit__=Mock(return_value=False)
+    sock.bind.side_effect=OSError(errno.EADDRINUSE,'in use')
+    monkeypatch.setattr(socket,'socket',Mock(return_value=sock))
+    with pytest.raises(lab.DashboardPortError):lab.check_dashboard_port(8765)
+    sock.__exit__.assert_called_once()
+    sock.bind.assert_called_once_with(('127.0.0.1',8765))

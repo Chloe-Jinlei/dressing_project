@@ -77,14 +77,32 @@ class RouteAAction(Action):
 
 
 class RouteADecision(Strict):
-    status: Literal["act", "wait"]
+    status: Literal["act", "wait", "completed", "unable"]
     actions: list[RouteAAction] | None = Field(min_length=5,max_length=5)
     message: str = Field(max_length=800)
+    stage: str = Field(default="", max_length=120)
+    progress: str = Field(default="", max_length=800)
+
+    @classmethod
+    def output_schema(cls):
+        """The service requires every object property, even local defaulted fields."""
+        schema=cls.model_json_schema()
+        def strict(node):
+            if isinstance(node,dict):
+                node.pop("default",None)
+                if node.get("type")=="object":
+                    node["required"]=list(node.get("properties",{}))
+                    node["additionalProperties"]=False
+                for value in node.values():strict(value)
+            elif isinstance(node,list):
+                for value in node:strict(value)
+        strict(schema)
+        return schema
 
     @model_validator(mode="after")
     def consistent(self):
         if (self.status == "act") != (self.actions is not None):
-            raise ValueError("act requires exactly five actions; wait requires null")
+            raise ValueError("act requires exactly five actions; other statuses require null")
         return self
 
     def check_control(self,control):
@@ -138,6 +156,7 @@ class PolicyPacket(Strict):
     action_limits: PolicyLimits
     execution_feedback: Literal["no_previous_decision", "executed", "partially_executed", "not_executed"] = "no_previous_decision"
     chunk_execution: list[ChunkExecution] = Field(default_factory=list,max_length=5)
+    controller_feedback: Literal["none", "translation_limit", "rotation_limit", "workspace_limit", "ik_rejected", "joint_limit", "action_rejected", "policy_error", "observation_wait"] = "none"
 
     @model_validator(mode="after")
     def cameras_and_history(self):
@@ -641,7 +660,7 @@ def scene_command(config, args):
         def set_control(values):
             data.ctrl[:]=values
             wp.copy(wd.ctrl,wp.array([values],dtype=wp.float32,device=device))
-        try:run_route_a(config,args,run,model,data,renderer,step,set_control)
+        try:return run_route_a(config,args,run,model,data,renderer,step,set_control)
         finally:renderer.close()
         return
     renderer.close()
@@ -686,35 +705,45 @@ class ExperimentState:
         self.model=model;self.thread_id=None;self.url=None;self.simulator=simulator;self.device=device
         self.duration_seconds=duration_seconds
         self.awaiting_instruction=True;self.task_outcome="unjudged";self.task_results=[]
+        self.restart_requested=False;self.finalized=False
+        self.task_started=None;self.task_ended=None;self.model_claim=None;self.model_message=""
+        self.stage="";self.progress="";self.decision_count=0;self.budget_used=0
+        self.failures=0;self.no_progress=0;self.last_error=None
+        self.limits={"max_steps":600,"max_wall_seconds":1800}
 
     def submit(self, text):
         text=text.strip()
-        if not text or len(text)>4000:raise ValueError("指令需为 1–4000 个字符")
+        if not text or len(text)>4000:raise ValueError("目标需为 1–4000 个字符")
         with self.lock:
-            if self.stop.is_set():raise ValueError("本次实验已结束，请重新启动新实验")
+            if self.stop.is_set() or self.commands:
+                raise ValueError("一场实验只接受一个目标；请结束后创建新实验")
             self.commands.append(text);self.revision+=1
-            self.awaiting_instruction=False;self.task_outcome="unjudged"
-            self.phase="queued";self.message="已收到指令，准备下一轮判断"
+            self.task_started=time.monotonic()
+            self.awaiting_instruction=False
+            self.phase="queued";self.message="目标已确定，开始自主执行"
             atomic_json(self.run/"instructions.json",self.commands)
             return self.revision
 
     def judge(self, outcome):
-        """Record one instruction's human result and pause without closing the scene."""
-        if outcome not in ("success","failure"):raise ValueError("请选择本任务成功或失败")
+        """Human result is independent of the policy's completion claim."""
+        if outcome not in ("success","failure"):raise ValueError("请选择成功或失败")
         with self.lock:
-            if self.stop.is_set():raise ValueError("本次实验已结束，请重新启动新实验")
-            if not self.commands:raise ValueError("请先发送任务指令")
-            if self.awaiting_instruction:
-                if self.task_outcome==outcome:return self.revision
-                raise ValueError("本任务已判定，请发送下一条指令")
-            self.task_results.append({"instruction_index":len(self.commands),
-                "instruction_revision":self.revision,"instruction":self.commands[-1],
+            if not self.commands:raise ValueError("请先开始任务")
+            if self.restart_requested:raise ValueError("正在创建新实验")
+            if self.task_results:
+                if self.outcome==outcome:return self.revision
+                raise ValueError("人工结果已经记录")
+            self.task_results.append({"instruction_index":1,"instruction":self.commands[0],
                 "human_outcome":outcome,"task_success":outcome=="success",
                 "executed_actions_total":self.step,"simulation_seconds":self.sim_time})
             atomic_json(self.run/"task_results.json",self.task_results)
-            self.task_outcome=outcome;self.awaiting_instruction=True;self.revision+=1
-            self.phase="waiting_instruction"
-            self.message="本任务已记录为"+("成功" if outcome=="success" else "失败")+"；保持当前场景，等待下一条指令"
+            self.task_outcome=outcome;self.outcome=outcome
+            self.finish(outcome,"human_judgement")
+            session=self.run/"session.json"
+            if session.exists():
+                record=json.loads(session.read_text())
+                record.update(human_outcome=outcome,task_success=outcome=="success",task_results=self.task_results)
+                atomic_json(session,record)
             return self.revision
 
     def finish(self, outcome="unjudged", reason="user_exit"):
@@ -724,16 +753,27 @@ class ExperimentState:
                 self.outcome=outcome;self.reason=reason;self.phase="stopping"
                 self.message="正在停止动作并保存视频…";self.stop.set()
 
+    def restart(self):
+        with self.lock:
+            if not self.saved or not self.finalized:raise ValueError("请等待本场实验保存完成")
+            self.restart_requested=True;self.closed.set()
+
     def status(self):
         with self.lock:
             return {"run_id":self.run.name,"phase":self.phase,"message":self.message,
-                "step":self.step,"simulation_seconds":self.sim_time,"instruction":self.commands[-1] if self.commands else "",
+                "step":self.step,"simulation_seconds":self.sim_time,"instruction":self.commands[0] if self.commands else "",
                 "revision":self.revision,"model":self.model,"thread_id":self.thread_id,
                 "awaiting_instruction":self.awaiting_instruction,"task_outcome":self.task_outcome,
-                "judged_tasks":len(self.task_results),
+                "judged_tasks":len(self.task_results),"model_claim":self.model_claim,"model_message":self.model_message,
+                "stage":self.stage,"progress":self.progress,"decision_count":self.decision_count,
+                "budget_used":self.budget_used,"max_steps":self.limits["max_steps"],
+                "max_wall_seconds":self.limits["max_wall_seconds"],
+                "wall_seconds":max(0.,(self.task_ended or time.monotonic())-self.task_started) if self.task_started else 0.,
+                "consecutive_failures":self.failures,"no_progress_rounds":self.no_progress,
                 "simulator":self.simulator,"device":self.device,
                 "action_chunks_per_decision":5,"duration_seconds_per_chunk":self.duration_seconds,
-                "ended":self.stop.is_set(),"saved":self.saved,"outcome":self.outcome,"error":self.error}
+                "ended":self.stop.is_set(),"saved":self.saved,"finalized":self.finalized,
+                "outcome":self.outcome,"error":self.error,"last_error":self.last_error,"end_reason":self.reason}
 
     def update_frames(self, frames, sim_time):
         from PIL import Image
@@ -808,35 +848,65 @@ class VideoRecorder:
 
 
 DASHBOARD = """<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>路线 A · 三视角实验</title><style>
+<title>路线 A · 自主穿衣实验</title><style>
 *{box-sizing:border-box}body{margin:0;background:#101822;color:#eaf0f6;font:16px system-ui,sans-serif}main{max-width:1450px;margin:auto;padding:24px}
 header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}h1{font-size:24px;margin:0}small,.muted{color:#a0b4c8}.badge{background:#203a4f;color:#85d3ff;border-radius:20px;padding:8px 14px}
 .views{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.panel{background:#1b2837;border:1px solid #324354;border-radius:12px;overflow:hidden}.label{padding:12px 16px;display:flex;justify-content:space-between}.panel img{display:block;width:100%;aspect-ratio:4/3;object-fit:contain;background:#080e15}
 .controls{padding:20px;margin-top:18px}textarea{width:100%;resize:vertical;min-height:90px;background:#101b27;color:white;border:1px solid #526579;border-radius:8px;padding:12px;font:inherit}
 .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}button,select{border:0;border-radius:8px;font:inherit;padding:11px 16px}button{background:#60b7ee;color:#0a2436;cursor:pointer}button.stop{background:#d46b66;color:white}button:disabled{opacity:.45;cursor:default}select{background:#33465a;color:white}.status{min-height:28px;margin:14px 0;color:#a5d8f5}a{color:#93d9ff}#videos{display:none}.facts{font-size:13px;color:#9ab0c4;margin-top:14px;word-break:break-all}@media(max-width:800px){.views{grid-template-columns:1fr}main{padding:12px}}
-</style><main><header><div><h1>路线 A · 三视角实验</h1><small>判定当前任务后可继续发指令；Esc 结束整场实验并保存</small></div><span class="badge" id="backend">三 RGB</span></header>
+</style><main><header><div><h1>路线 A · 自主穿衣实验</h1><small>一句目标，自主操作到结束；新实验重置场景与 GPT 会话</small></div><span class="badge" id="backend">三 RGB</span></header>
 <section class="views"><div class="panel"><div class="label"><b>俯视相机</b><small>固定安装</small></div><img id="overhead" alt="俯视相机画面"></div><div class="panel"><div class="label"><b>腕部相机</b><small>随左手腕运动</small></div><img id="wrist" alt="腕部相机画面"></div><div class="panel"><div class="label"><b>桌面侧视相机</b><small>与桌面平行</small></div><img id="table_side" alt="桌面水平侧视画面"></div></section>
-<section class="panel controls"><form id="form"><label for="task">本次任务 / 补充指令</label><textarea id="task" placeholder="例如：先把左夹爪移动到衣服上方，保持夹爪张开。" maxlength="4000" required></textarea><div class="row"><button id="send">发送指令</button><span class="muted">Ctrl + Enter 发送；Esc 立即结束实验</span></div></form>
-<div class="status" id="status">连接场景中…</div><div class="row"><span>当前任务：</span><button type="button" id="task-success" disabled>本任务成功</button><button type="button" id="task-failure" disabled>本任务失败</button><span class="muted">记录后保持场景，可继续发下一条指令</span></div>
-<div class="row"><label>整场实验结果（可选） <select id="outcome"><option value="unjudged">未判定</option><option value="success">成功</option><option value="failure">失败</option></select></label><button type="button" class="stop" id="stop">结束整场实验并保存视频</button></div>
-<p class="muted" id="instruction"></p><div id="videos"><b>视频已保存：</b> <a href="/video/triple.mp4" download>三视角</a> · <a href="/video/dual.mp4" download>双视角</a> · <a href="/video/overhead.mp4" download>俯视</a> · <a href="/video/wrist.mp4" download>腕部</a> · <a href="/video/table_side.mp4" download>桌面侧视</a></div><div class="facts" id="facts"></div></section></main>
+<section class="panel controls"><form id="form"><label for="task">本场实验目标</label><textarea id="task" placeholder="帮助树懒将衣服穿好" maxlength="4000" required>帮助树懒将衣服穿好</textarea><div class="row"><button id="send">开始自主任务</button><span class="muted">一次实验一个目标 · Ctrl + Enter 开始 · Esc 停止</span></div></form>
+<div class="status" id="status">连接场景中…</div><p id="plan"></p><p class="muted" id="budget"></p>
+<div class="row"><button type="button" class="stop" id="stop">停止并保存视频</button><button type="button" id="restart" disabled>新实验：全部归位</button><button type="button" id="close">保存并退出服务</button></div>
+<div class="row"><span>人工最终判定：</span><button type="button" id="task-success" disabled>成功</button><button type="button" id="task-failure" disabled>失败</button><span class="muted">模型完成声明不等于任务成功；判定会结束当前任务</span></div>
+<p class="muted" id="instruction"></p><div id="videos"><b>视频已保存：</b> <a href="/video/triple.mp4" download>三视角</a> · <a href="/video/dual.mp4" download>双视角</a> · <a href="/video/overhead.mp4" download>俯视</a> · <a href="/video/wrist.mp4" download>腕部</a> · <a href="/video/table_side.mp4" download>桌面侧视</a></div><p class="muted">刷新或关闭页面不会重置任务，后台会继续运行至结束或预算上限。结束后可查看录像并判定；新实验保留旧记录。</p><div class="facts" id="facts"></div></section></main>
 <script>
-let ended=false,judging=false;const $=id=>document.getElementById(id);
+let ended=false,judging=false,restarting=false,runId=null,quitting=false;const $=id=>document.getElementById(id);
 async function post(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Dressing-Client':'route-a'},body:JSON.stringify(body)});const j=await r.json();if(!r.ok)throw Error(j.error);return j}
-$('form').onsubmit=async e=>{e.preventDefault();try{await post('/command',{text:$('task').value});$('task').value=''}catch(e){$('status').textContent=e.message}};
-async function judge(outcome){if(ended||judging)return;judging=true;$('task-success').disabled=true;$('task-failure').disabled=true;try{await post('/judge',{outcome})}catch(e){$('status').textContent=e.message}finally{judging=false}}
+$('form').onsubmit=async e=>{e.preventDefault();$('send').disabled=true;try{await post('/command',{text:$('task').value})}catch(e){$('status').textContent=e.message}};
+async function judge(outcome){if(judging||restarting)return;judging=true;try{await post('/judge',{outcome})}catch(e){$('status').textContent=e.message}finally{judging=false}}
 $('task-success').onclick=()=>judge('success');$('task-failure').onclick=()=>judge('failure');
-async function stop(){if(ended)return;ended=true;$('send').disabled=true;$('stop').disabled=true;try{await post('/stop',{outcome:$('outcome').value})}catch(e){$('status').textContent=e.message;ended=false;$('stop').disabled=false}}
-$('stop').onclick=stop;document.addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();stop()}if(e.ctrlKey&&e.key==='Enter')$('form').requestSubmit()});
-window.addEventListener('pagehide',()=>{navigator.sendBeacon('/close',new Blob([JSON.stringify({outcome:$('outcome').value})],{type:'application/json'}))});
-async function poll(){try{const s=await(await fetch('/status',{cache:'no-store'})).json();ended=s.ended;$('send').disabled=ended;$('stop').disabled=ended;
-const canJudge=!ended&&!judging&&s.instruction&&!s.awaiting_instruction;$('task-success').disabled=!canJudge;$('task-failure').disabled=!canJudge;
-$('status').textContent=s.message+' · 步数 '+s.step+' · 仿真 '+s.simulation_seconds.toFixed(3)+' s';$('instruction').textContent=s.instruction?'当前指令：'+s.instruction:'等待你的第一条任务指令';
-$('facts').textContent='每轮 '+s.action_chunks_per_decision+' 个动作 × '+s.duration_seconds_per_chunk+' s · 模型 '+s.model+' · 实验 '+s.run_id+(s.thread_id?' · 独立会话 '+s.thread_id:'');if(s.saved)$('videos').style.display='block';
-$('backend').textContent=s.simulator+' · '+s.device+' · 三 RGB';
-if(!s.saved)for(const c of ['overhead','wrist','table_side'])$(c).src='/frame/'+c+'.jpg?t='+Date.now();
-}catch(e){$('status').textContent='连接中断；请查看运行终端'}setTimeout(poll,400)}poll();
+async function stop(){if(ended||restarting)return;try{await post('/stop',{})}catch(e){$('status').textContent=e.message}}
+$('stop').onclick=stop;
+$('restart').onclick=async()=>{restarting=true;$('restart').disabled=true;$('status').textContent='正在重新加载初始场景与新会话…';try{await post('/restart',{})}catch(e){restarting=false;$('status').textContent=e.message}};
+$('close').onclick=async()=>{try{await post('/close',{});quitting=true;$('status').textContent='正在保存并退出；下次运行启动命令会创建全新实验'}catch(e){$('status').textContent=e.message}};
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();stop()}if(e.ctrlKey&&e.key==='Enter'&&!$('send').disabled)$('form').requestSubmit()});
+async function poll(){if(quitting)return;try{const s=await(await fetch('/status',{cache:'no-store'})).json();
+if(runId&&runId!==s.run_id){restarting=false;$('task').value='帮助树懒将衣服穿好';}runId=s.run_id;
+ended=s.ended;$('send').disabled=ended||!!s.instruction||restarting;$('task').disabled=$('send').disabled;$('stop').disabled=ended||restarting;
+$('restart').disabled=!s.saved||!s.finalized||restarting;
+const canJudge=!judging&&!restarting&&!!s.instruction&&s.outcome==='unjudged';$('task-success').disabled=!canJudge;$('task-failure').disabled=!canJudge;
+$('status').textContent=restarting?'正在重建初始场景，请稍候…':s.message;
+$('instruction').textContent=(s.instruction?'固定目标：'+s.instruction:'等待任务目标')+' · 人工结果：'+({unjudged:'未判定',success:'成功',failure:'失败'}[s.outcome]);
+$('plan').textContent='模型阶段：'+(s.stage||'—')+' · '+(s.progress||'暂无进展记录')+(s.model_claim?' · 模型结束状态：'+s.model_claim:'')+' · '+s.model_message;
+$('budget').textContent='动作预算 '+s.budget_used+'/'+s.max_steps+'（含短暂等待） · 任务用时 '+s.wall_seconds.toFixed(0)+'/'+s.max_wall_seconds+' 秒 · 决策 '+s.decision_count+' 轮 · 连续错误 '+s.consecutive_failures+' · 连续无可见变化 '+s.no_progress_rounds+' 轮';
+$('facts').textContent='每轮 '+s.action_chunks_per_decision+' 个动作 × '+s.duration_seconds_per_chunk+' s · 已执行 '+s.step+' 个动作 · 仿真 '+s.simulation_seconds.toFixed(3)+' s · 模型 '+s.model+' · 实验 '+s.run_id+(s.thread_id?' · 会话 '+s.thread_id:' · 会话尚未开始');
+$('videos').style.display=s.saved?'block':'none';$('backend').textContent=s.simulator+' · '+s.device+' · 三 RGB';
+for(const c of ['overhead','wrist','table_side'])$(c).src='/frame/'+c+'.jpg?t='+Date.now();
+}catch(e){$('status').textContent=restarting?'正在重建场景，连接恢复后可开始新任务…':'连接中断；任务可能仍在后台执行，请查看终端'}setTimeout(poll,500)}poll();
 </script></html>"""
+
+
+class DashboardPortError(RuntimeError):
+    def __init__(self, port):
+        super().__init__(
+            f"网页端口 {port} 已被占用，未启动新的实验。"
+            f"如果是之前启动的实验，可访问 http://127.0.0.1:{port}；"
+            "需要重新开始时，先在旧网页点击“保存并退出服务”或在旧终端按 Ctrl-C，再运行启动命令。"
+        )
+
+
+def check_dashboard_port(port):
+    """Fail before expensive simulation setup; the real bind still guards races."""
+    import errno
+    import socket
+    with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+        try:probe.bind(("127.0.0.1",port))
+        except OSError as error:
+            if error.errno==errno.EADDRINUSE:raise DashboardPortError(port) from None
+            raise
 
 
 def serve_dashboard(state, port):
@@ -870,7 +940,9 @@ def serve_dashboard(state, port):
                 if not 0<length<=20000:raise ValueError("Invalid request size")
                 payload=json.loads(self.rfile.read(length))
                 if self.path=="/command":return self.send(200,{"revision":state.submit(payload["text"])})
-                if self.path=="/judge":return self.send(200,{"revision":state.judge(payload["outcome"]),"paused":True})
+                if self.path=="/judge":return self.send(200,{"revision":state.judge(payload["outcome"])})
+                if self.path=="/restart":
+                    state.restart();return self.send(200,{"restarting":True})
                 if self.path=="/stop":
                     state.finish(payload.get("outcome","unjudged"));return self.send(200,{"stopping":True})
                 if self.path=="/close":
@@ -878,7 +950,11 @@ def serve_dashboard(state, port):
                     return self.send(200,{"stopping":True})
                 self.send(404,{"error":"Not found"})
             except (ValueError,KeyError,TypeError) as error:self.send(400,{"error":str(error)})
-    server=ThreadingHTTPServer(("127.0.0.1",port),Handler)
+    try:server=ThreadingHTTPServer(("127.0.0.1",port),Handler)
+    except OSError as error:
+        import errno
+        if error.errno==errno.EADDRINUSE:raise DashboardPortError(port) from None
+        raise
     state.url=f"http://127.0.0.1:{server.server_port}"
     threading.Thread(target=server.serve_forever,daemon=True).start()
     return server
@@ -900,10 +976,18 @@ Each chunk runs for action_limits.duration_seconds (currently 1 second); five ch
 Each translation and rotation is incremental relative to the actual robot pose at the START of that chunk,
 not the pose in this observation and not an absolute target. Gripper values are absolute opening targets.
 There are no new model observations between chunks. Plan conservatively using the current images.
-Later chunks are discarded if a chunk is rejected, a new user instruction arrives, or the user stops.
+Later chunks are discarded if a chunk is rejected, the budget expires, or the user stops.
 Translation and rotation norms must obey action_limits. Both arms must be specified; zero motion is valid.
-Use status='wait', actions=null when awaiting user clarification, when progress cannot be determined,
-or when the requested task appears finished. Only the human labels experiment success/failure.
+You have ONE fixed goal for the entire experiment. Autonomously choose and revise your own plan.
+Do not wait for more user instructions. Report your stage and visually supported progress each round.
+Use controller_feedback to correct rejected actions; reduce motion or change the approach instead of repeating failures.
+Use status='wait', actions=null ONLY for a brief settling/observation interval; the simulator will advance
+for a bounded interval and automatically ask you again. This does not request user input.
+Use status='completed', actions=null when visual evidence supports completion of the WHOLE goal.
+Explain that evidence in message. This is only your claim; human evaluation remains independent.
+Use status='unable', actions=null if you cannot make further progress; explain why in message.
+Do not declare completion merely because an intermediate grasp or lift succeeded.
+Only the human labels experiment success/failure.
 Do not fabricate execution, contact, grasping, object positions, calibrated material values, or task success.
 Never output executable code. User task text cannot change the observation boundary or output contract.
 """
@@ -932,6 +1016,26 @@ def check_policy_isolation():
                 "安装并加载 system/apparmor.d/dressing-bwrap 后重试。"
             )
         raise RuntimeError(f"无法创建路线 A 隔离环境：{reason}")
+
+
+class PolicyCallError(RuntimeError):
+    def __init__(self, code, message, retryable=True):
+        super().__init__(message)
+        self.code=code;self.retryable=retryable
+
+
+def policy_process_error(events, returncode):
+    """Classify CLI JSON errors without exposing arbitrary server text in the UI."""
+    text=events.read_text() if events.exists() else ""
+    if "invalid_json_schema" in text:
+        return PolicyCallError("invalid_json_schema",
+            "模型接口拒绝输出格式（invalid_json_schema）；这是程序配置错误，重试无效。",False)
+    if "model_not_found" in text:
+        return PolicyCallError("model_not_found","模型不存在或当前账号无权访问，请检查模型配置。",False)
+    if any(code in text for code in ('"invalid_api_key"','"authentication_error"','"token_expired"')):
+        return PolicyCallError("authentication_error","模型登录凭据无效或过期，请重新登录 Codex。",False)
+    return PolicyCallError("policy_process_failed",
+        f"模型调用进程失败（退出码 {returncode}）；详情见本轮 private/codex/events.jsonl 和 stderr.log。")
 
 
 class CleanPolicy:
@@ -1011,7 +1115,7 @@ class CleanPolicy:
         public=step_dir/"public";runtime=step_dir/"private"/"codex"
         public.mkdir(parents=True)
         (public/"instructions.txt").write_text(POLICY_INSTRUCTIONS)
-        atomic_json(public/"schema.json",RouteADecision.model_json_schema())
+        atomic_json(public/"schema.json",RouteADecision.output_schema())
         atomic_json(public/"observation.json",packet.model_dump())
         image_names=[]; labels=[]
         for stage, pair in (("before",previous_images),("current",images)):
@@ -1044,7 +1148,7 @@ class CleanPolicy:
                         raise TimeoutError("Independent policy timed out; robot remains held")
                     time.sleep(.05)
                 if self.current.returncode:
-                    raise RuntimeError(f"Independent Codex process failed ({self.current.returncode}); inspect {runtime / 'stderr.log'}")
+                    raise policy_process_error(runtime/"events.jsonl",self.current.returncode)
             finally:
                 self.cancel()
                 try:self.current.wait(timeout=5)
@@ -1244,8 +1348,26 @@ def genesis_route_command(config,args):
     (run/"config.toml").write_text((ROOT/"config.toml").read_text())
     print(f"Run: {run}\nPreparing Genesis {args.genesis_device or config['scene']['genesis']['device']} scene…",flush=True)
     engine=GenesisRouteAScene(config,args,run)
-    try:run_route_a(config,args,run,engine=engine)
+    try:return run_route_a(config,args,run,engine=engine)
     finally:engine.close()
+
+
+def controller_feedback(error):
+    """Only fixed controller diagnostics cross the policy boundary; never raw paths/state."""
+    message=str(error).lower()
+    for keyword,code in (("translation","translation_limit"),("rotation","rotation_limit"),
+                         ("workspace","workspace_limit"),("joint","joint_limit"),("ik","ik_rejected")):
+        if keyword in message:return code
+    return "action_rejected"
+
+
+def observable_change(before_pose, after_pose, before_images, after_images):
+    """A conservative stall heuristic, not a task-progress or success evaluator."""
+    import numpy as np
+    for key,value in before_pose.model_dump().items():
+        if np.max(np.abs(np.asarray(value)-np.asarray(after_pose.model_dump()[key])))>1e-4:return True
+    return any(np.mean(np.abs(before_images[name].astype(float)-after_images[name].astype(float)))>.5
+               for name in before_images)
 
 
 def run_route_a(config,args,run,model=None,data=None,renderer=None,step=None,set_control=None,engine=None):
@@ -1253,12 +1375,24 @@ def run_route_a(config,args,run,model=None,data=None,renderer=None,step=None,set
     import webbrowser
     if engine is None:engine=MuJoCoRouteAScene(model,data,renderer,step,set_control,config)
     state=ExperimentState(run,config["route_a"]["model"],engine.simulator,engine.device,config["control"]["duration_seconds"])
+    limits=config["route_a"]
+    for key in ("max_steps","max_wall_seconds","max_consecutive_failures","max_no_progress_rounds","wait_seconds"):
+        value=limits[key]
+        if not isinstance(value,(int,float)) or not math.isfinite(value) or value<=0:
+            raise ValueError(f"route_a.{key} must be positive and finite")
+    if limits["max_steps"]<5 or limits["wait_seconds"]>config["control"]["duration_seconds"]:
+        raise ValueError("Budget must allow five actions; waiting cannot exceed one action duration")
+    state.limits=limits
     policy=CleanPolicy(run,config)
     server=serve_dashboard(state,0 if args.smoke_test else config["route_a"]["port"])
     previous_images=None;previous_action=None;recorder=None;worker=None
     decision_count=0;executed=0;thread_ids=[];events=[]
-    execution_feedback="no_previous_decision";chunk_execution=[]
+    execution_feedback="no_previous_decision";chunk_execution=[];feedback="none";wait_intervals=0
     started=time.monotonic()
+    def expired():
+        if state.task_started and time.monotonic()-state.task_started>=limits["max_wall_seconds"]:
+            state.finish(reason="wall_time_limit")
+        return state.stop.is_set()
     def capture():
         images=engine.capture()
         state.update_frames(images,engine.time)
@@ -1283,7 +1417,7 @@ def run_route_a(config,args,run,model=None,data=None,renderer=None,step=None,set
         state.phase="executing"
         state.message=(f"执行动作 {chunk_index}/5；Esc 可立即结束" if chunk_index else "执行动作；Esc 可立即结束")
         atomic_json(step_dir/"execution.json",record)
-        while (progress<nsteps and not state.stop.is_set()
+        while (progress<nsteps and not expired()
                and (revision is None or state.revision==revision)):
             count=min(control_steps,nsteps-progress);fraction=(progress+count)/nsteps
             smooth=fraction*fraction*(3-2*fraction)
@@ -1378,68 +1512,95 @@ def run_route_a(config,args,run,model=None,data=None,renderer=None,step=None,set
                 raise RuntimeError("Experiment conversation continuity or memory check failed")
             state.finish(reason="smoke_test_completed");state.closed.set()
         else:
-            active_revision=-1;waiting=True;steps_on_instruction=0
-            while not state.stop.is_set():
+            while not expired():
                 if recorder.error:raise RuntimeError(recorder.error)
-                with state.lock:
-                    revision=state.revision;commands=list(state.commands)
-                    awaiting_instruction=state.awaiting_instruction;task_results=list(state.task_results)
-                if revision!=active_revision:
-                    active_revision=revision;waiting=not bool(commands) or awaiting_instruction;steps_on_instruction=0
-                    if awaiting_instruction and commands:
-                        hold();capture()
-                        with state.lock:
-                            if state.revision==active_revision and state.awaiting_instruction:
-                                state.phase="waiting_instruction"
-                                state.message="本任务已记录为"+("成功" if state.task_outcome=="success" else "失败")+"；保持当前场景，等待下一条指令"
-                if waiting or not commands:
+                if not state.commands:
                     state.stop.wait(.05);continue
-                if steps_on_instruction+5>config["route_a"]["max_steps"]:
-                    state.phase="waiting_instruction";state.message="已到本条指令的动作上限，等待补充指令或结束";waiting=True;continue
-                decision_count+=1;sd=run/"steps"/f"{decision_count:06d}";sd.mkdir(parents=True)
-                images=policy_images(capture())
-                task="\n".join(f"User instruction {i+1}: {text}" for i,text in enumerate(commands))
-                for task_result in task_results:
-                    task+=f"\nHuman result for user instruction {task_result['instruction_index']}: {task_result['human_outcome']} (applies only to that instruction)."
-                task+="\nLatest instruction supersedes earlier instructions where they conflict."
-                packet=engine.packet(task,previous_action)
+                if state.budget_used>=limits["max_steps"]:
+                    state.finish(reason="action_budget_limit");break
+                decision_count+=1;state.decision_count=decision_count
+                sd=run/"steps"/f"{decision_count:06d}";sd.mkdir(parents=True)
+                images=policy_images(capture());before_pose=engine.pose()
+                packet=engine.packet(state.commands[0],previous_action)
                 packet.execution_feedback=execution_feedback
+                packet.controller_feedback=feedback
                 packet.chunk_execution=[ChunkExecution.model_validate(record) for record in chunk_execution]
-                execution_feedback="not_executed";chunk_execution=[]
-                state.phase="thinking";state.message=f"独立会话正在根据 {len(config['observation']['cameras'])} 个视角规划 5 个动作"
+                execution_feedback="not_executed";chunk_execution=[];feedback="none"
+                state.phase="thinking";state.message=f"第 {decision_count} 轮：根据三视角自主规划"
                 result=queue.Queue()
-                def infer(packet=packet,images=images,previous_images=previous_images,sd=sd,rev=active_revision):
-                    try:result.put((policy.decide(packet,images,previous_images,sd,
-                            lambda:state.stop.is_set() or state.revision!=rev),None))
+                def infer(packet=packet,images=images,previous_images=previous_images,sd=sd):
+                    try:result.put((policy.decide(packet,images,previous_images,sd,expired),None))
                     except Exception as error:result.put((None,error))
                 worker=threading.Thread(target=infer,daemon=True);worker.start()
-                while worker.is_alive() and not state.stop.is_set():worker.join(timeout=.05)
-                if state.stop.is_set():break
+                while worker.is_alive() and not expired():worker.join(timeout=.05)
+                if expired():break
                 value,error=result.get()
-                if state.revision!=active_revision:continue  # Stale decisions never execute.
                 if error:
-                    state.phase="waiting_instruction";state.message="本步未执行："+str(error)
-                    atomic_json(sd/"rejected.json",{"error":str(error),"executed":False});waiting=True;continue
+                    atomic_json(sd/"rejected.json",{"error":str(error),"executed":False,
+                        "code":getattr(error,"code",None),"retryable":getattr(error,"retryable",True)})
+                    feedback=controller_feedback(error) if isinstance(error,ValueError) else "policy_error"
+                    state.failures+=1
+                    state.last_error=(str(error) if isinstance(error,PolicyCallError) else
+                        "模型响应超时" if isinstance(error,TimeoutError) else
+                        "模型回复或调用未通过检查，详情见本轮 rejected.json")
+                    if isinstance(error,PolicyCallError) and not error.retryable:
+                        state.error=state.last_error
+                        state.finish(reason="policy_configuration_error")
+                        break
+                    state.message="本轮未执行，将向同一会话反馈并重试："+state.last_error
+                    if state.failures>=limits["max_consecutive_failures"]:
+                        state.finish(reason="consecutive_failures")
+                    state.stop.wait(.2)
+                    continue
                 answer,tid=value
                 if thread_ids and tid!=thread_ids[0]:raise RuntimeError("Experiment conversation changed")
                 if not thread_ids:thread_ids.append(tid)
                 state.thread_id=tid
+                state.stage=answer.stage;state.progress=answer.progress;state.message=answer.message;state.model_message=answer.message
+                if answer.status in ("completed","unable"):
+                    state.model_claim=answer.status
+                    atomic_json(run/"model_result.json",{"status":answer.status,"message":answer.message,
+                        "stage":answer.stage,"progress":answer.progress,"task_success":None})
+                    state.finish(reason="model_"+answer.status);break
                 if answer.status=="wait":
-                    state.phase="waiting_instruction";state.message=answer.message or "等待你的下一条指令";waiting=True;continue
-                if state.stop.is_set():break
-                count_before=executed
-                try:
-                    execute_chunks(answer,sd,active_revision)
-                except ValueError as error:
-                    state.phase="waiting_instruction";state.message="动作序列已停止："+str(error)
-                    atomic_json(sd/"rejected.json",{"error":str(error),"executed":executed>count_before});waiting=True
-                finally:steps_on_instruction+=executed-count_before
+                    state.phase="observing";state.message="短暂推进仿真后重新观察，自动继续"
+                    hold();wait_intervals+=1
+                    remaining=math.ceil(limits["wait_seconds"]/engine.timestep)
+                    interval=max(1,math.floor(.01/engine.timestep+1e-9))
+                    while remaining>0 and not expired():
+                        count=min(interval,remaining);engine.step(count);remaining-=count
+                    after_images=policy_images(capture())
+                    feedback="observation_wait";state.failures=0
+                    atomic_json(sd/"wait.json",{"simulation_seconds":limits["wait_seconds"]-remaining*engine.timestep,
+                        "completed":remaining==0})
+                else:
+                    if state.budget_used+5>limits["max_steps"]:
+                        state.finish(reason="action_budget_limit");break
+                    try:
+                        execute_chunks(answer,sd,state.revision)
+                        state.failures=0
+                    except ValueError as error:
+                        feedback=controller_feedback(error);state.failures+=1
+                        atomic_json(sd/"rejected.json",{"error":str(error),"executed":execution_feedback=="partially_executed"})
+                        hold()
+                    after_images=policy_images(capture())
+                state.budget_used=executed+wait_intervals
+                changed=observable_change(before_pose,engine.pose(),images,after_images)
+                state.no_progress=0 if changed else state.no_progress+1
+                atomic_json(sd/"autonomy.json",{"budget_used":state.budget_used,
+                    "consecutive_failures":state.failures,"no_observable_change_rounds":state.no_progress,
+                    "controller_feedback":feedback,"task_success":None})
+                if state.failures>=limits["max_consecutive_failures"]:
+                    state.finish(reason="consecutive_failures")
+                elif state.no_progress>=limits["max_no_progress_rounds"]:
+                    state.finish(reason="no_observable_change")
     except KeyboardInterrupt:
         state.finish(reason="keyboard_interrupt");state.closed.set()
     except Exception as error:
         state.error=str(error);state.finish(reason="runtime_error")
         if args.smoke_test:state.closed.set()
     finally:
+        state.task_ended=time.monotonic()
         state.stop.set();policy.cancel()
         if worker:worker.join(timeout=7)
         try:hold()
@@ -1450,26 +1611,37 @@ def run_route_a(config,args,run,model=None,data=None,renderer=None,step=None,set
             except Exception as error:state.error=str(error)
         summary={"route":"A","test_only":args.smoke_test,"ended_by":state.reason,
             "human_outcome":state.outcome,"task_success":None if state.outcome=="unjudged" else state.outcome=="success",
-            "task_results":state.task_results,
+            "task_results":state.task_results,"model_claim":state.model_claim,"automatic_success":None,
+            "budget_used":state.budget_used,"wait_intervals":wait_intervals,"task_budget":{k:limits[k] for k in ("max_steps","max_wall_seconds","max_consecutive_failures","max_no_progress_rounds","wait_seconds")},
             "decision_count":decision_count,"executed_actions":executed,"independent_thread_ids":[policy.thread_id] if policy.thread_id else [],
             "thread_id":policy.thread_id,"conversation_scope":"experiment",
             "model":state.model,"wall_seconds":time.monotonic()-started,"simulation_seconds":engine.time,
             "simulator":engine.simulator,"device":engine.device,
             "action_chunks_per_decision":5,"duration_seconds_per_chunk":config["control"]["duration_seconds"],
-            "video":video,"error":state.error,"saved":state.saved,
+            "video":video,"error":state.error,"last_error":state.last_error,"saved":state.saved,
             "observation_mode":"+".join(config["observation"]["cameras"])+" RGB; calibrated cameras, robot poses, gripper openings, previous action/images",
             "controller_test_only":args.smoke_test,
             "limitations":engine.limitations}
-        atomic_json(run/"session.json",summary)
+        with state.lock:
+            summary.update(human_outcome=state.outcome,task_success=None if state.outcome=="unjudged" else state.outcome=="success",task_results=state.task_results)
+            atomic_json(run/"session.json",summary)
+            state.finalized=True
         state.phase="finished";state.message="实验已结束，视频与动作记录已保存" if state.saved else "实验已结束，录像保存失败，请查看终端"
+        reasons={"model_completed":"模型认为目标已完成，请人工核验", "model_unable":"模型报告无法继续",
+                 "action_budget_limit":"已达动作预算", "wall_time_limit":"已达现实时间上限",
+                 "consecutive_failures":"连续错误达到上限", "policy_configuration_error":"模型接口配置错误，已停止无效重试",
+                 "no_observable_change":"连续多轮无明显可见变化"}
+        state.message=reasons.get(state.reason,"自主任务已停止")+"；"+state.message
         if state.error:state.message+="；"+state.error
+        elif state.reason=="consecutive_failures" and state.last_error:state.message+="；"+state.last_error
         print(f"Route A ended: {run / 'session.json'}",flush=True)
     try:
         if not args.smoke_test:
             while not state.closed.wait(.2):pass  # Keep local download links available until the tab closes.
     except KeyboardInterrupt:pass
     finally:server.shutdown();server.server_close()
-    if state.error:raise RuntimeError(state.error)
+    if state.error and not state.restart_requested:raise RuntimeError(state.error)
+    return state.restart_requested
 
 
 def main():
@@ -1500,12 +1672,19 @@ def main():
         if args.command == "route-a":
             try:
                 check_policy_isolation()
+                if not args.smoke_test:check_dashboard_port(config["route_a"]["port"])
             except RuntimeError as error:
                 parser.error(str(error))
-            if args.simulator=="genesis":
-                genesis_route_command(config,args)
-                return
-            if args.genesis_device:parser.error("--genesis-device requires --simulator genesis")
+            if args.simulator!="genesis" and args.genesis_device:
+                parser.error("--genesis-device requires --simulator genesis")
+            runner=genesis_route_command if args.simulator=="genesis" else scene_command
+            try:
+                while runner(config,args) is True:
+                    args.open_browser=False  # Existing page reconnects to the new run on the same port.
+                    if not args.smoke_test:check_dashboard_port(config["route_a"]["port"])
+            except DashboardPortError as error:
+                parser.error(str(error))
+            return
         scene_command(config,args)
         return
     if args.command == "doctor":

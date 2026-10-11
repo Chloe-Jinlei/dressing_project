@@ -101,7 +101,8 @@ GPT 路线 A 每个动作执行 1 s，对应 100 个控制步／1000 个求解�
 
 树懒使用原 `sloth.npz` 的 551 个节点和 2549 个四面体，保留原 UV 和 PNG 纹理。
 衣服按 MuJoCo 相同的简化、尺寸和旋转规则处理：621 个节点、1199 个三角形、四个开口。
-两者位置、机械臂底座位置与朝向、桌子尺寸和相机位姿沿用原配置；质量分别为 0.18 kg 和 0.055 kg。
+两者位置、机械臂底座位置与朝向、桌子尺寸和相机位姿沿用原配置。树懒质量为 0.18 kg；
+Genesis 衣服按棉布面密度与网格面积计算，当前约 0.02050 kg，原 0.055 kg 仅保留用于 MuJoCo。
 
 `genesis_mesh_adapter.py` 针对 Genesis 1.4.3 的导入接口做了小范围适配，
 跳过 PBD 默认重新网格化，直接建立原网格上的约束。树懒原四面体外表面有一条非流形边，
@@ -110,17 +111,51 @@ GPT 路线 A 每个动作执行 1 s，对应 100 个控制步／1000 个求解�
 更换 Genesis 版本时需要重新审查该适配器。
 
 当前树懒为 `PBD.Elastic`，衣服为 `PBD.Cloth`，不是原 MuJoCo 的弹性模型。
-质量保持一致，但 PBD 的 compliance 参数尚未标定，不能直接当作原 Young's modulus、Poisson ratio 和 damping。
-树懒已调为更柔软的弹性体：`stretch_compliance` 从 `1e-7` 增至 `0.005`，
-`volume_compliance` 从 `0` 改为 `1e-12`，允许更容易弯曲和受压形变。
+不能把 PBD 的 compliance 直接当作原 Young's modulus、Poisson ratio 和 damping。
+当前树懒 `stretch_compliance=0.02`、`volume_compliance=1e-14`，
+拉伸松弛系数 0.3、体积松弛系数 0.05；它是可变形填充玩具的近似，未用实物标定。
 这两个参数及松弛系数统一放在 `../bunnylab/config.toml` 的
 `[scene.genesis.sloth_material]` 中，场景启动和 GPT 路线 A 的 Genesis worker 都读取此处。
 保留原来的 551 个节点、2549 个四面体、纹理和 0.18 kg 质量。
 重新启动场景后生效；旧的抬升录像与报告使用之前较硬的参数，不能视为当前软体参数的抬升验证。
-这组软体参数曾在 0.5 ms 子步、每步 20 子步下完成 CPU 静置验证：150 步、1.5 秒，状态有限且无桌面穿透；
+旧版软体参数曾在 0.5 ms 子步、每步 20 子步下完成 CPU 静置验证：150 步、1.5 秒，状态有限且无桌面穿透；
 结果见 [验证报告](runs/20261007-sloth-soft-material/report.json) 和
 [最终画面](runs/20261007-sloth-soft-material/settled-detail.png)。
 PBD 共用的接触粒子直径为 4 mm，与原来树懒/衣服的两个碰撞半径和衣服厚度不同。
+
+2026-10-10 棉布与软体修复：`[scene.genesis.garment_material]` 使用
+[Shibata 与 Hirai，Robotics 2016，Table 3 Cotton A](https://doi.org/10.3390/robotics5020010)
+的面密度 0.0211 g/cm²（211 g/m²）及 KES 弯曲刚度 0.0567 gf·cm²/cm
+（5.56036655e-6 N·m）。这是特定棉布样本，不能代表所有棉布或针织 T 恤。
+原网格面积约 0.0971593 m²，质量约 20.50 g；顶点质量按三角形面积分配。
+拉伸刚度 600 N/m 是独立的各向同性膜近似，**不是该论文实测拉伸数据**；
+摩擦、空气阻力和树懒的填充材料同样尚未实测标定，不能声称与特定实物完全一致。
+默认不模拟织物经纬各向异性、非线性拉伸或弯曲滞回。
+
+实际网格上的边弹簧柔顺度为 `3*l²/(4*S*A_adj)`；铰链柔顺度为
+`2*A_adj/(3*B*l²)`（B 使用 N·m）。后者来自相邻三角形重心距离
+`d=(h1+h2)/3` 下的薄壳能量 `B*l*theta²/(2*d)`。
+这些是离散近似，并非把杨氏模量的倒数直接赋给所有网格边。
+场景适配器修正角度梯度的归一化，加入每子步内累计的 XPBD 乘子；
+衣服拉伸迭代 32 次，树懒拉伸保持 8 次，体积迭代 32 次。还修正原体积位移中重复乘梯度平方的问题，
+避免软化树懒后体积约束几乎不生效。已安装的 Genesis 源码未修改。
+刚体接触投影后，增加接触方向受限的体积不等式约束（目标最小体积为原单元的 10%），
+防止少量贴桌面薄四面体被投影压平或翻转；它允许节点离开接触面或沿面移动，
+不把物体重置到原形，也不指定动画。该稳定化未验证附加的机器人反作用力。
+`report.json` 的 `cotton_material` 记录实际逐边参数范围，`genesis.materials`
+中的布料标量 compliance 仅是分配字段前的初始值。
+
+验证输出在 `runs/cotton-material-validation/`：`verified/deformation.mp4`
+使用原始衣服和树懒，仅固定局部小片，其余顶点受重力自由运动，不逐帧指定形变。
+3 秒时扣除最佳刚体变换后的 RMS 形变为衣服约 47 mm、树懒约 5.05 mm；
+树懒体积比约 1.00011，采样帧无四面体翻转，衣服边伸长比的 99 分位数约 1.068。
+这是材料悬挂测试，不是机器人抓取或穿衣成功验证。
+`verified-hinge/report.json`、`verified-volume/report.json` 的弯曲和体积单步结果
+与独立数值能量梯度相符。`verified-scene/report.json` 的完整桌面场景
+完成 5 秒 CUDA 仿真，采样检查及最终状态无倒置或压平单元、无桌面穿透，五视角正常。
+控制端 51 项测试、5 项控制与材料单元测试、3 项实际 GPU 材料测试通过。
+重启网页服务后才加载新代码及参数，已有视频和已启动进程保持原行为。
+
 该版本原生的 legacy rigid/PBD 接触通过 SDF 投影粒子，未实现这个分支的摩擦。
 当前场景已用 `genesis_mesh_adapter.py` 中的版本检查适配器补上静／动摩擦：
 在每个 0.001 s 子步内，仅对发生接触的自由粒子按法向投影量限制切向修正，
@@ -172,16 +207,18 @@ uv run dressing route-a --simulator genesis --open-browser
 
 CPU 模式显式加 `--genesis-device cpu`。真实模型与会话记忆检查加 `--smoke-test`。
 这些命令需要独立版 Codex CLI、自己的登录／模型权限、bubblewrap 和 ffmpeg，与原路线 A 相同。
-同一次实验持续同一个 GPT 对话：默认观察俯视／腕部／桌面侧视图像和机械臂状态，每轮输出五个小幅平移／旋转／开合动作，
-经过验证后由 Genesis 顺序执行，再反馈新图像。默认每个 chunk 在 2 cm 内、0.1 rad 内，执行 1 s 仿真。
-每个增量相对该 chunk 开始时的实际机器人姿态；等待则输出 `status="wait", actions=null`。
-单个 chunk 验证失败、补充指令或 Esc 会停止余下动作，下一轮反馈已执行及未完成的 chunk。
-修改时长统一使用 `../bunnylab/config.toml` 的 `[control].duration_seconds`；求解器子步仍为 0.001 s。
-GPT worker 的双臂启用重力补偿，与脚本抬升使用相同设置，避免 1 s 动作的静态下沉累计。
-网页的“本任务成功 / 本任务失败”只记录当前指令结果并暂停，保留当前姿态、抓取和同一个 GPT 会话；
-可以继续发送“保持树懒的抓取，把衣服提起来”等下一条指令。
-逐条人工判定保存在 `task_results.json`，下一轮也提供给模型。
-“结束整场实验并保存视频”、Esc 或关闭页面才终止整场实验；整场人工结果独立记录。
+同一次实验持续同一个 GPT 对话，只输入一个完整目标，由模型自主规划并循环操作。
+每轮观察俯视／腕部／桌面侧视图像和机械臂状态，输出五个有界动作；默认每个 chunk 在 2 cm 内、
+0.1 rad 内，执行 1 s 仿真。动作验证失败会向同一会话反馈有限的拒绝原因，自动重试。
+`wait` 现在表示短暂推进仿真后自动重新观察；`completed` 和 `unable` 结束本场操作并保存录像。
+模型完成声明与人工成功判定分开记录；本版本未添加自动几何成功判定。
+默认预算为 600 个动作（短暂等待也占名额）、30 分钟现实时间、连续 5 次错误或 8 轮无明显可见变化。
+配置及准确行为见 [自主任务网页说明](../bunnylab/README.md#路线-a-自主任务网页)。
+网页的人工成功／失败按钮记录最终结果并停止任务；“新实验：全部归位”在保存后重建原场景、
+建立空白 GPT 会话和新的运行目录，旧录像与记录保留。刷新／关闭页面不会重置后台实验；
+点击“保存并退出服务”或终端 Ctrl-C 后，再次运行启动命令会创建新实验。
+修改动作时长仍统一使用 `../bunnylab/config.toml` 的 `[control].duration_seconds`；
+求解器子步仍为 0.001 s。GPT worker 的双臂重力补偿、场景和相机配置保持不变。
 若侧视只供人工观察，将 `[observation].cameras` 改为 `["overhead", "wrist"]`；侧视仍保留在网页和录像中。
 
 Genesis 继续使用本目录自己的环境；统一入口用进程间接口传递允许的观测和动作，
@@ -278,14 +315,28 @@ bash ~/Desktop/genesis-local/run-dressing.sh --task dress-sloth --substeps 20 --
 
 续跑仅在初始化时恢复保存的粒子、关节位置并将速度置零，随后重新建立已记录的局部抓取；
 初始化与连续动力学复现有区别，会在报告中明确记录。控制器不把物体设置到目标姿态。
-穿衣模式额外用衣服顶点、边中点和面中心与树懒三角形表面建立采样接触约束：
-按节点逆质量施加双方碰撞修正，被夹爪固定的节点不参与位移修正。
-接触约束在每个物理子步与原有伸长、体积约束交替求解，位置修正按相邻最短边限制，
-避免只在外层控制步末修正而造成布片过度拉伸。这不是连续三角形碰撞，也不是把衣服移动到目标姿态。
-实现使用 Genesis 1.4.3 的求解器字段及内核，未修改安装的 Genesis 源码；报告记录额外迭代和接触缓存。
-0.6 秒布料落下碰撞检查通过：无超过 3 mm 的穿透采样点，布料最大边长比 1.238，
-树懒体积比 0.993–1.000；见 [接触检查报告](runs/20261007-sloth-dressing/substep-contact-check/report.json)。
-该检查验证碰撞稳定性，不代表穿衣成功。
+衣服与树懒现在在网页路线 A、默认静置和脚本穿衣中共用面接触求解器：
+每个物理子步检查双向顶点–三角面和边–边接触，用扫掠包围盒和前一子步的所在侧检查跨面运动，
+按逆质量给两者施加相反修正；固定的抓取节点保持固定。默认表面间隙 1 mm，
+参数位于 `config.toml` 的 `[scene.genesis.surface_contact]`。
+可视网格逐点绑定对应的物理节点，避免前后布片被邻点蒙皮混合。
+接触缓存溢出或迭代后仍有严重未解决接触时会报错停止，不会静默丢弃约束。
+旧的仅脚本穿衣使用的控制步采样接触已移除，避免重复求解。
+实现使用 Genesis 1.4.3 的求解器字段及内核，未修改安装的 Genesis 源码。
+这不是任意速度、任意变形下有数学保证的连续碰撞检测；布料自身仍使用原生粒子自碰撞。
+衣服原始网格已有缝合的前后两片，内部中空，保留下摆、领口和两个袖口共四个开口。
+
+碰撞回归使用 5 m/s 布片撞击大三角面，以及原始衣服落到原始软体树懒上的 1.5 s 仿真。
+后者同时检查布点/面中心的内部深度、双向网格边与三角面的相交、树懒体积和桌面接触。
+运行：
+
+```bash
+cd /home/icebear/Desktop/dressing_project/genesis-local
+GENESIS_SURFACE_TEST_RUN_DIR="$PWD/runs/surface-contact-check" .venv/bin/python -m unittest test_genesis_route.SurfaceCollisionIntegrationTests
+```
+
+每次使用新的输出目录。验证产物见 `runs/surface-contact-validation/verified/`。
+这些检查验证接触行为，不代表穿衣任务成功。
 穿衣模式、默认静置和 GPT 路线 A 都使用上面的子步级刚体／PBD 摩擦适配器。
 穿衣模式原先按重力估算法向支撑冲量的外层速度修正已移除，避免重复施加摩擦。
 该适配仍未验证真实接触压力或纯摩擦夹持负载；局部无滑动抓取约束继续用于抓取。
@@ -307,3 +358,24 @@ bash ~/Desktop/genesis-local/install.sh
 依赖快照、源码提交和验证日志分别保存在 `installed-packages.txt`、`installed-commit.txt`、`verify-cpu.log` 和 `verify-cuda.log`。
 
 官方说明：https://github.com/Genesis-Embodied-AI/genesis-world#quick-installation
+
+## 独立衣服开口诊断
+
+`check_garment_opening.py` 是独立的环境能力检查，不修改 GPT 提示词或网页策略。
+脚本用原始网格选取下摆抓取点，通过网页同一个 `GenesisController` 的
+动作检查、关节控制和接触抓取尝试提起一片、再抓另一片并分离。
+不直接设置物体位置、不增加额外的布料固定点、不改变碰撞或材料。
+它使用仿真几何和更频繁的反馈，因此结果不能作为 GPT 自主规划的成绩。
+
+```bash
+cd /home/icebear/Desktop/dressing_project/genesis-local
+GS_CACHE_FILE_PATH="$PWD/.cache/genesis" XDG_CACHE_HOME="$PWD/.cache" MPLCONFIGDIR="$PWD/.cache/matplotlib" \
+  .venv/bin/python check_garment_opening.py --grasp-x .098 --output runs/my-opening-check
+```
+
+每次指定一个新的输出目录。`opening.mp4` 包含俯视和侧视，`report.json` 记录
+失败原因、抓取是否混合前后片及开口指标，`measurements.jsonl` 保存逐帧数据，
+`script.py` 保存当次脚本版本。动作接触使用原有无滑动绑定近似。
+投影开口面积和内切圆半径只作为筛查指标；投影自交时不判定开口成功，
+投影非自交也不能单独证明三维通道畅通或衣服自碰撞正确。
+一次失败只能说明该次操作未成功，不能证明所有可行策略都无法打开衣服。
